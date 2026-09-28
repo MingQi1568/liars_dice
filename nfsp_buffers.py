@@ -2,7 +2,7 @@
 import random
 from collections import deque, namedtuple
 
-Transition = namedtuple("Transition", "state action reward next_state done next_mask")
+Transition = namedtuple("Transition", "state action reward next_state done mask next_mask")
 
 
 class ReplayBuffer:

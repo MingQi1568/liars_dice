@@ -10,9 +10,13 @@ epsilon/LR decay schedules are computed as a fraction of this total, so it appli
 you're starting fresh or resuming (extending the total horizon re-plans the remaining decay
 over the new, longer horizon rather than leaving epsilon/LR stuck at their old floor).
 
+--arch picks the network ("flat" = original, "shared_face" = face-shared heads); it is stored in
+the checkpoint, so --resume always uses the checkpoint's arch. Checkpoints are written to
+checkpoints/<arch>/ by default so a new run never overwrites older models.
+
 Usage:
-    python3 train_nfsp.py --total-episodes 50000 --dice 5
-    python3 train_nfsp.py --resume checkpoints/nfsp_latest.pt --total-episodes 250000
+    python3 train_nfsp.py --total-episodes 50000 --arch shared_face
+    python3 train_nfsp.py --resume checkpoints/shared_face/nfsp_latest.pt --total-episodes 250000
 """
 import argparse
 import os
@@ -26,7 +30,9 @@ from torch import optim
 
 from game import Game, PlayerState
 from bots import SmartBot
-from nfsp_model import NFSPConfig, NFSPNet, NFSPTrainingBot, NFSPBot, collate_states
+from nfsp_model import (
+    NFSPConfig, NFSPTrainingBot, NFSPBot, build_net, collate_for, forward_batch, forward_states,
+)
 from nfsp_buffers import ReplayBuffer, ReservoirBuffer, Transition
 
 
@@ -56,12 +62,12 @@ def run_episode(q_net, sl_net, cfg, eta, epsilon, device):
         traj = bot.trajectory
         n = len(traj)
         for t in range(n):
-            feats, action_idx, _mask = traj[t]
+            feats, action_idx, mask = traj[t]
             done = t == n - 1
             r = reward if done else 0.0
             next_state = traj[t + 1][0] if not done else None
             next_mask = traj[t + 1][2] if not done else None
-            transitions.append(Transition(feats, action_idx, r, next_state, done, next_mask))
+            transitions.append(Transition(feats, action_idx, r, next_state, done, mask, next_mask))
         sl_samples.extend(bot.sl_samples)
     return transitions, sl_samples
 
@@ -71,24 +77,23 @@ def train_q_step(q_net, q_target, optimizer, batch, gamma, device, cfg):
     rewards = torch.tensor([t.reward for t in batch], dtype=torch.float32, device=device)
     dones = torch.tensor([t.done for t in batch], dtype=torch.bool, device=device)
 
-    states = [t.state for t in batch]
-    hand, dice, seq, lengths = collate_states(states, device)
-    q_values = q_net(hand, dice, seq, lengths)
+    masks = torch.stack([t.mask for t in batch])
+    q_values = forward_batch(q_net, collate_for(cfg, [t.state for t in batch], device), masks)
     q_sa = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-    # Terminal transitions have no next_state; fill with the current state as a dummy --
-    # its Q-value gets multiplied by 0 via `dones` below, so it never contributes.
+    # Terminal transitions have no next_state; fill with the current state as a dummy and an
+    # all-False mask -- its Q-value gets multiplied by 0 via `dones` below, so it never contributes.
     next_states = [t.next_state if t.next_state is not None else t.state for t in batch]
     next_masks = torch.stack([
         t.next_mask if t.next_mask is not None else torch.zeros(cfg.n_actions, dtype=torch.bool)
         for t in batch
     ]).to(device)
-    ns_hand, ns_dice, ns_seq, ns_lengths = collate_states(next_states, device)
+    next_batch = collate_for(cfg, next_states, device)
     with torch.no_grad():
-        next_q_online = q_net(ns_hand, ns_dice, ns_seq, ns_lengths)
+        next_q_online = forward_batch(q_net, next_batch, next_masks)
         next_q_online = next_q_online.masked_fill(~next_masks, float("-inf"))
         next_actions = next_q_online.argmax(dim=1)
-        next_q_target = q_target(ns_hand, ns_dice, ns_seq, ns_lengths)
+        next_q_target = forward_batch(q_target, next_batch, next_masks)
         next_q = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
         next_q = torch.where(dones, torch.zeros_like(next_q), next_q)
         target = rewards + gamma * next_q
@@ -103,8 +108,10 @@ def train_q_step(q_net, q_target, optimizer, batch, gamma, device, cfg):
 def train_sl_step(sl_net, optimizer, batch, device):
     states = [b[0] for b in batch]
     actions = torch.tensor([b[1] for b in batch], device=device)
-    hand, dice, seq, lengths = collate_states(states, device)
-    logits = sl_net(hand, dice, seq, lengths)
+    masks = torch.stack([b[2] for b in batch]).to(device)
+    logits = forward_states(sl_net, states, masks, device)
+    # Labels are always legal actions, so masking illegal slots keeps them out of the softmax.
+    logits = logits.masked_fill(~masks, -1e9)
     loss = F.cross_entropy(logits, actions)
     optimizer.zero_grad()
     loss.backward()
@@ -161,6 +168,8 @@ def main():
                          help="override the episode counter on resume (needed for checkpoints saved before "
                               "the 'episode' field was added to the checkpoint format)")
     parser.add_argument("--dice", type=int, default=5, help="ignored when --resume is set (uses checkpoint's config)")
+    parser.add_argument("--arch", type=str, default="shared_face", choices=["flat", "shared_face"],
+                         help="network architecture; ignored when --resume is set (uses checkpoint's config)")
     parser.add_argument("--eta", type=float, default=0.1, help="anticipatory param: P(play in best-response mode)")
     parser.add_argument("--eps-start", type=float, default=0.08)
     parser.add_argument("--eps-end", type=float, default=0.01)
@@ -179,7 +188,8 @@ def main():
     parser.add_argument("--eval-every", type=int, default=2000, help="episodes between eval/checkpoint/loss print")
     parser.add_argument("--eval-games", type=int, default=200)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                         help="default: checkpoints/<arch>, so runs never overwrite each other's models")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -197,14 +207,17 @@ def main():
         print(f"resuming from {args.resume} at episode {start_ep}", flush=True)
     else:
         ckpt = None
-        cfg = NFSPConfig(dice_count=args.dice)
+        cfg = NFSPConfig(dice_count=args.dice, arch=args.arch)
 
-    print(f"device={device} dice_count={cfg.dice_count} n_actions={cfg.n_actions} "
-          f"start_ep={start_ep} total_episodes={args.total_episodes}", flush=True)
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = os.path.join("checkpoints", cfg.arch)
 
-    q_net = NFSPNet(cfg).to(device)
-    q_target = NFSPNet(cfg).to(device)
-    sl_net = NFSPNet(cfg).to(device)
+    print(f"device={device} arch={cfg.arch} dice_count={cfg.dice_count} n_actions={cfg.n_actions} "
+          f"start_ep={start_ep} total_episodes={args.total_episodes} checkpoint_dir={args.checkpoint_dir}", flush=True)
+
+    q_net = build_net(cfg).to(device)
+    q_target = build_net(cfg).to(device)
+    sl_net = build_net(cfg).to(device)
     q_opt = optim.Adam(q_net.parameters(), lr=args.rl_lr)
     sl_opt = optim.Adam(sl_net.parameters(), lr=args.sl_lr)
 
