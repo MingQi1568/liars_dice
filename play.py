@@ -139,13 +139,22 @@ class AnnouncingGame(Game):
                 self.current_player = self.next_alive_player(self.current_player)
 
 
-def play_game(num_bots=2, starting_dice=5, seed=None):
+def build_opponent(model: str):
+    if model == "best":
+        from best_bot import build_best_bot
+        return build_best_bot()
+    from nfsp_model import NFSPBot
+    return NFSPBot.from_checkpoint(model)
+
+
+def play_game(num_bots=2, starting_dice=5, seed=None, model="best"):
     if seed is not None:
         random.seed(seed)
-    from best_bot import build_best_bot
+    if model != "best" and num_bots != 1:
+        raise ValueError("NFSP checkpoints currently only support 1v1 (--bots 1) -- trained for 2-player games only.")
 
     human = PlayerState(name="You", bot=HumanBot("You"))
-    bots = [PlayerState(name=f"Bot{i+1}", bot=build_best_bot()) for i in range(num_bots)]
+    bots = [PlayerState(name=f"Bot{i+1}", bot=build_opponent(model)) for i in range(num_bots)]
     players = [human] + bots
     # Random seating
     random.shuffle(players)
@@ -166,5 +175,9 @@ if __name__ == "__main__":
     p.add_argument("--bots", type=int, default=2, help="Number of bot opponents (default 2)")
     p.add_argument("--dice", type=int, default=5, help="Starting dice per player (default 5)")
     p.add_argument("--seed", type=int, default=None, help="Random seed")
+    p.add_argument("--model", type=str, default="best",
+                    help="'best' (default) for the hand-tuned bot, or a path to an NFSP checkpoint "
+                         "(e.g. checkpoints/nfsp_latest.pt) to play against a trained NFSP bot. "
+                         "NFSP checkpoints require --bots 1.")
     args = p.parse_args()
-    play_game(num_bots=args.bots, starting_dice=args.dice, seed=args.seed)
+    play_game(num_bots=args.bots, starting_dice=args.dice, seed=args.seed, model=args.model)
