@@ -8,7 +8,7 @@ import torch
 
 from bots import RandomBot, SmartBot
 from game import Bid, Bot, Game, GameState, PlayerState
-from nfsp_model import NFSPConfig, legal_action_mask
+from nfsp_model import NFSPConfig, encode_state_shared, legal_action_mask
 from vec_env import Spec, VecEnv, legal_mask, make_features, py_features
 
 import torch.nn.functional as F
@@ -106,6 +106,25 @@ def _scripted_round(dice_p, bids, caller_is_next):
         PlayerState.roll = orig_roll
     winner_idx = next((i for i, p in enumerate(ps) if p.num_dice == 0), -1)
     return [ps[0].num_dice, ps[1].num_dice], g.current_player, winner_idx
+
+
+def test_liar_and_faceid_variants_match_python_encoder():
+    """The two new vec_env.make_features variants (shared_face_liar, shared_face_liar_faceid)
+    must match nfsp_model.encode_state_shared's static feature block for the matching arch --
+    same differential check as test_features_match_python_encoder, just for the new variants."""
+    for variant in ("shared_face_liar", "shared_face_liar_faceid"):
+        for dice in (5, 2, 1):
+            spec, cfg = Spec(dice=dice), NFSPConfig(dice_count=dice, arch=variant)
+            states = collect_states(300, dice=dice, seed=dice)
+            counts, hq, hf, c = arrays_from_states(states, spec)
+            masks = torch.stack([legal_action_mask(s, cfg) for s in states])
+            static, _, _ = make_features(spec, counts, c["hand"], c["opp"], c["cq"], c["cf"], hq, hf,
+                                          c["hlen"], c["opener"], c["p"], masks, variant=variant)
+            for i, s in enumerate(states):
+                ref_static, _ = encode_state_shared(s, cfg, masks[i])
+                assert torch.allclose(ref_static, static[i], atol=1e-6), \
+                    (variant, dice, i, (ref_static - static[i]).abs().max())
+        print(f"  ok variant={variant}")
 
 
 def test_round_resolution_matches_engine():

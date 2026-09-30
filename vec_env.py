@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from nfsp_model import S_CLAIM, S_FACE1, S_FACES, S_GLOBAL, S_LIAR, STATIC_DIM  # noqa: F401  (re-exported)
+from nfsp_model import FACE_ID_DIM, S_CLAIM, S_FACE1, S_FACES, S_GLOBAL, S_LIAR, STATIC_DIM  # noqa: F401  (re-exported)
 
 
 @dataclass(frozen=True)
@@ -55,11 +55,20 @@ def legal_mask(spec: Spec, cq: torch.Tensor, cf: torch.Tensor) -> torch.Tensor:
     return torch.cat([raise_ok.reshape(n, -1), liar_ok[:, None]], dim=1)
 
 
-def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask):
+def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask, variant="shared_face"):
     """counts [n,7] (index = face 1..6); hand/opp/cq/cf/hlen/opener/p [n]; hq/hf [n,H]; mask [n,A].
 
-    Returns static [n,STATIC_DIM], win [n,K,bid_dim], wmask [n,K] (True where a real bid sits).
+    `variant` mirrors NFSPConfig.arch and must produce exactly what
+    nfsp_model.encode_state_shared produces for that arch: "shared_face" (default) is the
+    original layout; "shared_face_liar" (v2) uses prior-only opponent history, adds the current
+    claim's quantity to every face row and the face-1 row, and adds the claimed face's prior
+    max/count to the liar block; "shared_face_liar_faceid" is v2 plus a one-hot face identity
+    appended to every face row.
+
+    Returns static [n, STATIC_DIM variant], win [n,K,bid_dim], wmask [n,K] (True where a real bid sits).
     """
+    v2 = variant in ("shared_face_liar", "shared_face_liar_faceid")
+    add_face_id = variant == "shared_face_liar_faceid"
     n = counts.shape[0]
     dev = counts.device
     dc, qmax = float(spec.dice), spec.qmax
@@ -69,9 +78,13 @@ def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask
     eff = counts + c1[:, None]
     eff[:, 1] = c1
 
+    # Opponent max bid / bid count per face. v2 excludes the last history entry, which is always
+    # the current bid itself (bidding alternates, so the player being asked to act never made the
+    # standing bid) -- "opponent history" then means bids before the current claim.
     H = hq.shape[1]
     ar = torch.arange(H, device=dev)[None, :]
-    hvalid = ar < hlen[:, None]
+    hist_len = (hlen - 1).clamp(min=0) if v2 else hlen
+    hvalid = ar < hist_len[:, None]
     bidder = opener[:, None] ^ (ar & 1)
     by_opp = hvalid & (bidder != p[:, None])
     oh = F.one_hot(hf, 7).bool() & by_opp[:, :, None]
@@ -92,7 +105,8 @@ def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask
     equal = (hasc & ~cb_one & (fcol == cfc)).float()
     eff_f = eff[:, 2:7].float()
     mn_f = mn[:, 1:6].float()
-    faces = torch.stack([
+    claim_q = cq.clamp(max=qcap).float() / qcap * has.float()
+    face_cols = [
         eff_f / dc,
         (handf / dc)[:, None].expand(n, 5),
         (total / (2 * dc))[:, None].expand(n, 5),
@@ -101,30 +115,45 @@ def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask
         opp_times[:, 2:7].clamp(max=qmax).float() / qmax,
         mn_f / qcap,
         (mn_f - eff_f) / qcap,
-    ], dim=-1)
+    ]
+    if v2:
+        face_cols.append((hasc & (fcol == cfc)).float() * claim_q[:, None])
+    faces = torch.stack(face_cols, dim=-1)
+    if add_face_id:
+        face_id = torch.eye(FACE_ID_DIM, device=dev).unsqueeze(0).expand(n, FACE_ID_DIM, FACE_ID_DIM)
+        faces = torch.cat([faces, face_id], dim=-1)
 
     c1f = c1.float()
-    face1 = torch.stack([
+    face1_cols = [
         c1f / dc, handf / dc, total / (2 * dc), (has & (cf == 1)).float(),
         opp_max[:, 1].clamp(max=qcap).float() / qcap,
         opp_times[:, 1].clamp(max=qmax).float() / qmax,
         mn[:, 0].float() / qcap, (mn[:, 0].float() - c1f) / qcap,
-    ], dim=-1)
+    ]
+    if v2:
+        face1_cols.append((cf == 1).float() * claim_q)
+    face1 = torch.stack(face1_cols, dim=-1)
 
     cfs = cf.clamp(min=1)
     eff_claim = eff.gather(1, cfs[:, None]).squeeze(1)
     needed = (cq - eff_claim).clamp(min=0)
     hasf = has.float()
-    liar = torch.stack([
+    liar_cols = [
         needed.clamp(max=qcap).float() / qcap,
         (needed.float() / oppf.clamp(min=1.0)).clamp(max=2.0) / 2.0,
         eff_claim.float() / dc, total / (2 * dc), oppf / dc,
         cq.clamp(max=qcap).float() / qcap,
         (needed.float() > oppf).float(), (cf == 1).float(),
-    ], dim=-1) * hasf[:, None]
+    ]
+    if v2:
+        liar_cols += [
+            opp_max.gather(1, cfs[:, None]).squeeze(1).clamp(max=qcap).float() / qcap,
+            opp_times.gather(1, cfs[:, None]).squeeze(1).clamp(max=qmax).float() / qmax,
+        ]
+    liar = torch.stack(liar_cols, dim=-1) * hasf[:, None]
     claim = F.one_hot(cfs - 1, 6).float() * hasf[:, None]
     glob = torch.stack([handf / dc, oppf / dc, c1f / dc, hasf], dim=-1)
-    static = torch.cat([glob, faces.reshape(n, 50), face1, liar, claim], dim=-1)
+    static = torch.cat([glob, faces.reshape(n, -1), face1, liar, claim], dim=-1)
 
     K = spec.window
     j = torch.arange(K, device=dev)[None, :]
@@ -156,8 +185,8 @@ class Obs:
 class VecEnv:
     """N independent games. Player 0 opens round 1; a game is over when a player hits 0 dice."""
 
-    def __init__(self, spec: Spec, n: int):
-        self.spec, self.n = spec, n
+    def __init__(self, spec: Spec, n: int, variant: str = "shared_face"):
+        self.spec, self.n, self.variant = spec, n, variant
         D, H = spec.dice, spec.max_hist
         self.dice = torch.zeros(n, 2, D, dtype=torch.long)
         self.nd = torch.full((n, 2), D, dtype=torch.long)
@@ -189,7 +218,7 @@ class VecEnv:
         mask = legal_mask(self.spec, cq, cf)
         static, win, wmask = make_features(
             self.spec, counts, self.nd[idx, p], self.nd[idx, 1 - p], cq, cf,
-            self.hq[idx], self.hf[idx], self.hlen[idx], self.opener[idx], p, mask)
+            self.hq[idx], self.hf[idx], self.hlen[idx], self.opener[idx], p, mask, variant=self.variant)
         return Obs(static, win, wmask, mask, p)
 
     def step(self, idx, action, shaping: float = 0.0):

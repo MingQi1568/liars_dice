@@ -126,6 +126,43 @@ S_LIAR = slice(62, 70)
 S_CLAIM = slice(70, 76)     # one-hot of the claimed face; only used to select e_claim inside forward()
 STATIC_DIM = 76
 
+# ---------- "shared_face_liar" (v2) and "shared_face_liar_faceid" (v3) variants ----------
+# Relative to "shared_face", v2 separates "opponent's history on a face" from "what they're
+# claiming right now", which the original conflates (its per-face opp_max includes the
+# current bid, so on the claimed face's row it mostly just echoes the current quantity):
+#   - opponent max/count per face are computed over PRIOR bids only (current bid excluded),
+#   - each face row (and the face-1 row) gets an explicit current-claim quantity, nonzero
+#     only on the claimed face's row,
+#   - the liar block gets the prior max/count for the claimed face directly (2 scalars),
+#   - the raise-scoring MLPs get a per-candidate "jump" = how far the candidate quantity
+#     is past the current bid's quantity.
+# v3 is v2 plus a one-hot face identity appended to every face row, deliberately breaking
+# the shared_face weight-tying invariance to test whether per-face signal helps.
+FACE_ID_DIM = 5                            # one-hot over faces 2..6
+FACE_FEATS_V2 = FACE_FEATS + 1             # 11: + current-claim quantity
+FACE_FEATS_V3 = FACE_FEATS_V2 + FACE_ID_DIM   # 16
+FACE1_FEATS_V2 = FACE1_FEATS + 1           # 9: + current-claim quantity (when the claim is on 1s)
+LIAR_SCALARS_V2 = LIAR_SCALARS + 2         # 10
+LIAR_CQ_INDEX = 5                          # position of min(cb.quantity, qcap)/qcap in the liar block
+FACE_EMB_V2 = 32
+Q_EMB_V2 = 16
+SCORE_HIDDEN_V2 = 128
+LIAR_HIDDEN_V2 = 64
+
+
+def _shared_face_v2_layout(face_feats):
+    """(S_GLOBAL, S_FACES, S_FACE1, S_LIAR, S_CLAIM, STATIC_DIM) for a v2/v3 face-row width."""
+    f_end = 4 + 5 * face_feats
+    f1_end = f_end + FACE1_FEATS_V2
+    l_end = f1_end + LIAR_SCALARS_V2
+    return slice(0, 4), slice(4, f_end), slice(f_end, f1_end), slice(f1_end, l_end), slice(l_end, l_end + 6), l_end + 6
+
+
+S_GLOBAL_V2, S_FACES_V2, S_FACE1_V2, S_LIAR_V2, S_CLAIM_V2, STATIC_DIM_V2 = _shared_face_v2_layout(FACE_FEATS_V2)  # 84
+S_GLOBAL_V3, S_FACES_V3, S_FACE1_V3, S_LIAR_V3, S_CLAIM_V3, STATIC_DIM_V3 = _shared_face_v2_layout(FACE_FEATS_V3)  # 109
+
+SHARED_FACE_ARCHES = ("shared_face", "shared_face_liar", "shared_face_liar_faceid")
+
 
 def _my_face_counts(dice: list[int]) -> list[int]:
     counts = [0] * 7  # index by face 1..6
@@ -172,8 +209,19 @@ def encode_state_shared(state: GameState, cfg: NFSPConfig, mask=None):
 
     Only own dice + public information are used. All quantity-valued features saturate at
     max_quantity+1 so absurd (out-of-grid) bids can't blow up the scale.
+
+    cfg.arch selects the variant:
+      "shared_face"                original features, unchanged.
+      "shared_face_liar"           v2: opponent history per face is PRIOR-only (current bid
+                                    excluded); each face row and the face-1 row get the current
+                                    claim's quantity (nonzero only on the claimed face's row);
+                                    the liar block gets the claimed face's prior max/count.
+      "shared_face_liar_faceid"    v2 plus a one-hot face identity appended to every face row
+                                    (breaks the face-weight-tying invariance on purpose).
     """
     assert state.num_players == 2, "NFSP model currently only supports 1v1 games"
+    v2 = cfg.arch in ("shared_face_liar", "shared_face_liar_faceid")
+    add_face_id = cfg.arch == "shared_face_liar_faceid"
     if mask is None:
         mask = legal_action_mask(state, cfg)
     dc = cfg.dice_count
@@ -186,12 +234,17 @@ def encode_state_shared(state: GameState, cfg: NFSPConfig, mask=None):
     total = state.total_dice
     cb = state.current_bid
 
+    # In real play bid_history's last entry is always `cb` itself (bidding alternates, so the
+    # player being asked to act never made the standing bid). v2 excludes it so "opponent
+    # history" means bids *before* the current claim; the claim itself gets its own feature.
+    history = state.bid_history[:-1] if (v2 and cb is not None) else state.bid_history
     opp_max = [0] * 7
     opp_times = [0] * 7
-    for pidx, bid in state.bid_history:
+    for pidx, bid in history:
         if pidx != state.my_index:
             opp_max[bid.face] = max(opp_max[bid.face], bid.quantity)
             opp_times[bid.face] += 1
+    claim_q = min(cb.quantity, qcap) / qcap if cb is not None else 0.0
 
     raise_ok = mask[: qmax * 6].tolist()
 
@@ -211,11 +264,18 @@ def encode_state_shared(state: GameState, cfg: NFSPConfig, mask=None):
         else:
             above, below, equal = float(f > cb.face), float(f < cb.face), float(f == cb.face)
         mn = min_next(f)
-        faces += [
+        row = [
             eff / dc, hand / dc, total / (2 * dc), above, below, equal,
             min(opp_max[f], qcap) / qcap, min(opp_times[f], qmax) / qmax,
             mn / qcap, (mn - eff) / qcap,
         ]
+        if v2:
+            row.append(claim_q if cb is not None and cb.face == f else 0.0)
+        if add_face_id:
+            face_id = [0.0] * FACE_ID_DIM
+            face_id[f - 2] = 1.0
+            row += face_id
+        faces += row
 
     mn1 = min_next(1)
     face1 = [
@@ -223,18 +283,22 @@ def encode_state_shared(state: GameState, cfg: NFSPConfig, mask=None):
         min(opp_max[1], qcap) / qcap, min(opp_times[1], qmax) / qmax,
         mn1 / qcap, (mn1 - count_1s) / qcap,
     ]
+    if v2:
+        face1.append(claim_q if cb is not None and cb.face == 1 else 0.0)
 
     claim = [0.0] * 6
     if cb is None:
-        liar = [0.0] * LIAR_SCALARS
+        liar = [0.0] * (LIAR_SCALARS_V2 if v2 else LIAR_SCALARS)
     else:
         eff = _eff_count(counts, cb.face)
         needed = max(0, cb.quantity - eff)
         liar = [
             min(needed, qcap) / qcap, min(needed / opp, 2.0) / 2.0,
             eff / dc, total / (2 * dc), opp / dc,
-            min(cb.quantity, qcap) / qcap, float(needed > opp), float(cb.face == 1),
+            claim_q, float(needed > opp), float(cb.face == 1),
         ]
+        if v2:
+            liar += [min(opp_max[cb.face], qcap) / qcap, min(opp_times[cb.face], qmax) / qmax]
         claim[cb.face - 1] = 1.0
 
     glob = [hand / dc, opp / dc, count_1s / dc, float(cb is not None)]
@@ -243,8 +307,8 @@ def encode_state_shared(state: GameState, cfg: NFSPConfig, mask=None):
 
 
 def encode_state(state: GameState, cfg: NFSPConfig, mask=None):
-    """flat: (hand[6], dice_counts[2], bid_seq[T, D]); shared_face: (static[76], bid_seq[T, D])."""
-    if cfg.arch == "shared_face":
+    """flat: (hand[6], dice_counts[2], bid_seq[T, D]); shared_face variants: (static, bid_seq[T, D])."""
+    if cfg.arch in SHARED_FACE_ARCHES:
         return encode_state_shared(state, cfg, mask)
     return (
         encode_hand(state.my_dice, cfg),
@@ -375,23 +439,114 @@ class SharedFaceNet(nn.Module):
         return torch.cat([flat_raise, liar], dim=-1)
 
 
+class SharedFaceNetV2(nn.Module):
+    """"shared_face_liar" and "shared_face_liar_faceid" (the latter when cfg.arch says so):
+    SharedFaceNet's structure, sized up, reading the v2/v3 static layout (prior-only opponent
+    history, explicit current-claim quantity per face row, claimed face's prior max/count in
+    the liar block), plus a per-candidate "jump" feature in both raise-scoring MLPs: how far the
+    candidate quantity is past the current bid's quantity, which matters for raising on *any*
+    face (5x4 -> 5x6 is a cheap raise, 5x4 -> 8x2 an aggressive one)."""
+
+    def __init__(self, cfg: NFSPConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.face_id = cfg.arch == "shared_face_liar_faceid"
+        self.face_feats = FACE_FEATS_V3 if self.face_id else FACE_FEATS_V2
+        (self.s_global, self.s_faces, self.s_face1, self.s_liar, self.s_claim,
+         _) = _shared_face_v2_layout(self.face_feats)
+        g = cfg.gru_hidden + GLOBAL_SCALARS
+        score_in = g + FACE_EMB_V2 + Q_EMB_V2 + 3   # + gap, ratio, jump
+        self.gru = nn.GRU(input_size=cfg.bid_feature_dim, hidden_size=cfg.gru_hidden, batch_first=True)
+        self.shared_face_mlp = nn.Sequential(
+            nn.Linear(self.face_feats, FACE_EMB_V2), nn.ReLU(), nn.Linear(FACE_EMB_V2, FACE_EMB_V2))
+        self.face1_mlp = nn.Sequential(
+            nn.Linear(FACE1_FEATS_V2, FACE_EMB_V2), nn.ReLU(), nn.Linear(FACE_EMB_V2, FACE_EMB_V2))
+        self.quantity_embedding = nn.Embedding(cfg.max_quantity, Q_EMB_V2)
+        self.q_score_mlp = nn.Sequential(
+            nn.Linear(score_in, SCORE_HIDDEN_V2), nn.ReLU(), nn.Linear(SCORE_HIDDEN_V2, 1))
+        self.face1_score_mlp = nn.Sequential(
+            nn.Linear(score_in, SCORE_HIDDEN_V2), nn.ReLU(), nn.Linear(SCORE_HIDDEN_V2, 1))
+        self.liar_head = nn.Sequential(
+            nn.Linear(g + LIAR_SCALARS_V2 + FACE_EMB_V2 + 2, LIAR_HIDDEN_V2), nn.ReLU(),
+            nn.Linear(LIAR_HIDDEN_V2, 1))
+
+    def forward(self, static, bid_seq, lengths, mask):
+        cfg = self.cfg
+        B = static.shape[0]
+        Q = cfg.max_quantity
+        dc = float(cfg.dice_count)
+
+        packed = nn.utils.rnn.pack_padded_sequence(bid_seq, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, h_n = self.gru(packed)
+        scal = static[:, self.s_global]
+        ctx = torch.cat([h_n[-1], scal], dim=-1)
+
+        fi = static[:, self.s_faces].reshape(B, 5, self.face_feats)
+        e_f = self.shared_face_mlp(fi)
+        e_1 = self.face1_mlp(static[:, self.s_face1])
+
+        qs = torch.arange(1, Q + 1, device=static.device, dtype=static.dtype)
+        q_emb = self.quantity_embedding.weight
+        opp = (scal[:, 1] * dc).view(B, 1, 1)
+        liar_scal = static[:, self.s_liar]
+        cq = liar_scal[:, LIAR_CQ_INDEX] * (Q + 1)          # current bid quantity (0 when no bid stands)
+        jump = ((qs.view(1, Q) - cq.unsqueeze(-1)) / Q).view(B, 1, Q, 1)
+
+        def extras(eff):
+            gap = qs.view(1, 1, Q) - eff.unsqueeze(-1)
+            ratio = (gap.clamp(min=0) / opp).clamp(max=2.0) / 2.0
+            return (gap / Q).unsqueeze(-1), ratio.unsqueeze(-1)
+
+        gap_f, ratio_f = extras(fi[:, :, 0] * dc)
+        comb_f = torch.cat([
+            ctx.view(B, 1, 1, -1).expand(B, 5, Q, -1),
+            e_f.unsqueeze(2).expand(B, 5, Q, -1),
+            q_emb.view(1, 1, Q, -1).expand(B, 5, Q, -1),
+            gap_f, ratio_f, jump.expand(B, 5, Q, 1)], dim=-1)
+        s_f = self.q_score_mlp(comb_f).squeeze(-1)
+
+        gap_1, ratio_1 = extras((scal[:, 2] * dc).unsqueeze(-1))
+        comb_1 = torch.cat([
+            ctx.view(B, 1, 1, -1).expand(B, 1, Q, -1),
+            e_1.view(B, 1, 1, -1).expand(B, 1, Q, -1),
+            q_emb.view(1, 1, Q, -1).expand(B, 1, Q, -1),
+            gap_1, ratio_1, jump], dim=-1)
+        s_1 = self.face1_score_mlp(comb_1).squeeze(-1).squeeze(1)
+
+        flat_raise = torch.cat([s_1.unsqueeze(-1), s_f.permute(0, 2, 1)], dim=-1).reshape(B, Q * 6)
+
+        raise_mask = mask[:, : Q * 6]
+        with torch.no_grad():
+            best = flat_raise.detach().masked_fill(~raise_mask, float("-inf")).max(dim=1).values
+            best = torch.where(torch.isfinite(best), best, torch.zeros_like(best))
+        n_legal = raise_mask.to(flat_raise.dtype).sum(dim=1) / (Q * 6)
+
+        e_all = torch.cat([e_1.unsqueeze(1), e_f], dim=1)
+        e_claim = (static[:, self.s_claim].unsqueeze(-1) * e_all).sum(dim=1)
+        liar_in = torch.cat([ctx, liar_scal, e_claim, best.unsqueeze(-1), n_legal.unsqueeze(-1)], dim=-1)
+        liar = self.liar_head(liar_in)
+        return torch.cat([flat_raise, liar], dim=-1)
+
+
 def build_net(cfg: NFSPConfig) -> nn.Module:
     if cfg.arch == "shared_face":
         return SharedFaceNet(cfg)
+    if cfg.arch in ("shared_face_liar", "shared_face_liar_faceid"):
+        return SharedFaceNetV2(cfg)
     if cfg.arch == "flat":
         return NFSPNet(cfg)
-    raise ValueError(f"unknown arch {cfg.arch!r} (expected 'flat' or 'shared_face')")
+    raise ValueError(f"unknown arch {cfg.arch!r}")
 
 
 def collate_for(cfg: NFSPConfig, feats_list, device):
-    if cfg.arch == "shared_face":
+    if cfg.arch in SHARED_FACE_ARCHES:
         return collate_shared(feats_list, device)
     return collate_states(feats_list, device)
 
 
 def forward_batch(net, batch, masks):
-    """Run either architecture on an already-collated batch. `masks`: (B, n_actions) bool."""
-    if net.cfg.arch == "shared_face":
+    """Run any architecture on an already-collated batch. `masks`: (B, n_actions) bool."""
+    if net.cfg.arch in SHARED_FACE_ARCHES:
         static, seq, lengths = batch
         return net(static, seq, lengths, masks.to(static.device))
     hand, dice_counts, seq, lengths = batch

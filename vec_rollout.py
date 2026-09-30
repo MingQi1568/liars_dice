@@ -39,7 +39,7 @@ def play_batch(q_net, sl_net, cfg: NFSPConfig, spec: Spec, eta: float, epsilon: 
     best-response mode, SL reservoir samples only from the greedy best-response branch) but
     batched. Returns (transitions, sl_samples) in run_episode's own format, for all n_games
     combined -- a drop-in replacement for `n_games` calls to run_episode."""
-    env = VecEnv(spec, n_games)
+    env = VecEnv(spec, n_games, variant=cfg.arch)
     env.reset()
     mode_br = torch.rand(n_games, 2) < eta          # mode_br[g,p]: True = best-response, False = avg
     traj = [([], []) for _ in range(n_games)]        # traj[g][p] = list of (feats, action, mask)

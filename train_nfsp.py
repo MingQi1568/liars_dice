@@ -34,6 +34,10 @@ from nfsp_model import (
     NFSPConfig, NFSPTrainingBot, NFSPBot, build_net, collate_for, forward_batch, forward_states,
 )
 from nfsp_buffers import ReplayBuffer, ReservoirBuffer, Transition
+from vec_env import Spec
+from vec_rollout import play_batch as vec_play_batch
+
+ARCH_CHOICES = ["flat", "shared_face", "shared_face_liar", "shared_face_liar_faceid"]
 
 
 def pick_device(name: str) -> torch.device:
@@ -168,8 +172,11 @@ def main():
                          help="override the episode counter on resume (needed for checkpoints saved before "
                               "the 'episode' field was added to the checkpoint format)")
     parser.add_argument("--dice", type=int, default=5, help="ignored when --resume is set (uses checkpoint's config)")
-    parser.add_argument("--arch", type=str, default="shared_face", choices=["flat", "shared_face"],
+    parser.add_argument("--arch", type=str, default="shared_face", choices=ARCH_CHOICES,
                          help="network architecture; ignored when --resume is set (uses checkpoint's config)")
+    parser.add_argument("--gru-hidden", type=int, default=None,
+                         help="GRU hidden size; ignored when --resume is set. Default: 64 for 'shared_face', "
+                              "96 for the larger 'shared_face_liar*' variants")
     parser.add_argument("--eta", type=float, default=0.1, help="anticipatory param: P(play in best-response mode)")
     parser.add_argument("--eps-start", type=float, default=0.08)
     parser.add_argument("--eps-end", type=float, default=0.01)
@@ -191,6 +198,10 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                          help="default: checkpoints/<arch>, so runs never overwrite each other's models")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--vec-games", type=int, default=0,
+                         help="if > 0, generate self-play with the vectorized engine (vec_rollout.play_batch) "
+                              "this many games at a time per round, instead of one game at a time. Much faster "
+                              "self-play; gradient updates are unchanged either way.")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -207,7 +218,10 @@ def main():
         print(f"resuming from {args.resume} at episode {start_ep}", flush=True)
     else:
         ckpt = None
-        cfg = NFSPConfig(dice_count=args.dice, arch=args.arch)
+        gru_hidden = args.gru_hidden
+        if gru_hidden is None:
+            gru_hidden = 96 if args.arch in ("shared_face_liar", "shared_face_liar_faceid") else 64
+        cfg = NFSPConfig(dice_count=args.dice, arch=args.arch, gru_hidden=gru_hidden)
 
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join("checkpoints", cfg.arch)
@@ -252,46 +266,88 @@ def main():
         torch.save(payload, os.path.join(args.checkpoint_dir, "nfsp_latest.pt"))
         torch.save(payload, os.path.join(args.checkpoint_dir, f"nfsp_ep{ep}.pt"))
 
+    def log_and_checkpoint(ep, epsilon, rl_lr, sl_lr):
+        wr_smart = evaluate(sl_net, cfg, device, lambda: SmartBot(), args.eval_games)
+        wr_best = evaluate(sl_net, cfg, device, _best_bot_factory(), args.eval_games)
+        elapsed = (time.time() - start_time) / 60
+        print(
+            f"[ep {ep}/{args.total_episodes}] eps={epsilon:.3f} rl_lr={rl_lr:.2e} sl_lr={sl_lr:.2e} "
+            f"rl_buf={len(rl_buffer)} sl_buf={len(sl_buffer)} "
+            f"q_loss={q_loss_tracker.pop_mean():.4f} sl_loss={sl_loss_tracker.pop_mean():.4f} "
+            f"win_vs_SmartBot={wr_smart:.1%} win_vs_BestBot={wr_best:.1%} elapsed={elapsed:.1f}m",
+            flush=True,
+        )
+        save_checkpoint(ep)
+
     ep = start_ep
     try:
-        for ep in range(start_ep + 1, args.total_episodes + 1):
-            epsilon = max(args.eps_end, linear_decay(args.eps_start, args.eps_end, ep / eps_decay_episodes))
-            rl_lr = max(args.rl_lr_end, linear_decay(args.rl_lr, args.rl_lr_end, ep / lr_decay_episodes))
-            sl_lr = max(args.sl_lr_end, linear_decay(args.sl_lr, args.sl_lr_end, ep / lr_decay_episodes))
-            for g in q_opt.param_groups:
-                g["lr"] = rl_lr
-            for g in sl_opt.param_groups:
-                g["lr"] = sl_lr
+        if args.vec_games > 0:
+            spec = Spec(dice=cfg.dice_count)
+            next_sync = (start_ep // args.target_sync_every + 1) * args.target_sync_every
+            next_eval = (start_ep // args.eval_every + 1) * args.eval_every
+            while ep < args.total_episodes:
+                round_size = min(args.vec_games, args.total_episodes - ep)
+                mid_ep = ep + round_size // 2
+                epsilon = max(args.eps_end, linear_decay(args.eps_start, args.eps_end, mid_ep / eps_decay_episodes))
+                rl_lr = max(args.rl_lr_end, linear_decay(args.rl_lr, args.rl_lr_end, mid_ep / lr_decay_episodes))
+                sl_lr = max(args.sl_lr_end, linear_decay(args.sl_lr, args.sl_lr_end, mid_ep / lr_decay_episodes))
+                for g in q_opt.param_groups:
+                    g["lr"] = rl_lr
+                for g in sl_opt.param_groups:
+                    g["lr"] = sl_lr
 
-            transitions, sl_samples = run_episode(q_net, sl_net, cfg, args.eta, epsilon, device)
-            for t in transitions:
-                rl_buffer.push(t)
-            for s in sl_samples:
-                sl_buffer.push(s)
+                transitions, sl_samples = vec_play_batch(q_net, sl_net, cfg, spec, args.eta, epsilon, round_size)
+                for t in transitions:
+                    rl_buffer.push(t)
+                for s in sl_samples:
+                    sl_buffer.push(s)
+                ep += round_size
 
-            for _ in range(args.updates_per_episode):
-                if len(rl_buffer) >= args.batch_size:
-                    q_loss = train_q_step(q_net, q_target, q_opt, rl_buffer.sample(args.batch_size), args.gamma, device, cfg)
-                    q_loss_tracker.add(q_loss)
-                if len(sl_buffer) >= args.batch_size:
-                    sl_loss = train_sl_step(sl_net, sl_opt, sl_buffer.sample(args.batch_size), device)
-                    sl_loss_tracker.add(sl_loss)
+                for _ in range(args.updates_per_episode * round_size):
+                    if len(rl_buffer) >= args.batch_size:
+                        q_loss = train_q_step(q_net, q_target, q_opt, rl_buffer.sample(args.batch_size), args.gamma, device, cfg)
+                        q_loss_tracker.add(q_loss)
+                    if len(sl_buffer) >= args.batch_size:
+                        sl_loss = train_sl_step(sl_net, sl_opt, sl_buffer.sample(args.batch_size), device)
+                        sl_loss_tracker.add(sl_loss)
 
-            if ep % args.target_sync_every == 0:
-                q_target.load_state_dict(q_net.state_dict())
+                while ep >= next_sync:
+                    q_target.load_state_dict(q_net.state_dict())
+                    next_sync += args.target_sync_every
+                while ep >= next_eval or ep >= args.total_episodes:
+                    log_and_checkpoint(ep, epsilon, rl_lr, sl_lr)
+                    next_eval += args.eval_every
+                    if ep >= args.total_episodes:
+                        break
+        else:
+            for ep in range(start_ep + 1, args.total_episodes + 1):
+                epsilon = max(args.eps_end, linear_decay(args.eps_start, args.eps_end, ep / eps_decay_episodes))
+                rl_lr = max(args.rl_lr_end, linear_decay(args.rl_lr, args.rl_lr_end, ep / lr_decay_episodes))
+                sl_lr = max(args.sl_lr_end, linear_decay(args.sl_lr, args.sl_lr_end, ep / lr_decay_episodes))
+                for g in q_opt.param_groups:
+                    g["lr"] = rl_lr
+                for g in sl_opt.param_groups:
+                    g["lr"] = sl_lr
 
-            if ep % args.eval_every == 0 or ep == args.total_episodes:
-                wr_smart = evaluate(sl_net, cfg, device, lambda: SmartBot(), args.eval_games)
-                wr_best = evaluate(sl_net, cfg, device, _best_bot_factory(), args.eval_games)
-                elapsed = (time.time() - start_time) / 60
-                print(
-                    f"[ep {ep}/{args.total_episodes}] eps={epsilon:.3f} rl_lr={rl_lr:.2e} sl_lr={sl_lr:.2e} "
-                    f"rl_buf={len(rl_buffer)} sl_buf={len(sl_buffer)} "
-                    f"q_loss={q_loss_tracker.pop_mean():.4f} sl_loss={sl_loss_tracker.pop_mean():.4f} "
-                    f"win_vs_SmartBot={wr_smart:.1%} win_vs_BestBot={wr_best:.1%} elapsed={elapsed:.1f}m",
-                    flush=True,
-                )
-                save_checkpoint(ep)
+                transitions, sl_samples = run_episode(q_net, sl_net, cfg, args.eta, epsilon, device)
+                for t in transitions:
+                    rl_buffer.push(t)
+                for s in sl_samples:
+                    sl_buffer.push(s)
+
+                for _ in range(args.updates_per_episode):
+                    if len(rl_buffer) >= args.batch_size:
+                        q_loss = train_q_step(q_net, q_target, q_opt, rl_buffer.sample(args.batch_size), args.gamma, device, cfg)
+                        q_loss_tracker.add(q_loss)
+                    if len(sl_buffer) >= args.batch_size:
+                        sl_loss = train_sl_step(sl_net, sl_opt, sl_buffer.sample(args.batch_size), device)
+                        sl_loss_tracker.add(sl_loss)
+
+                if ep % args.target_sync_every == 0:
+                    q_target.load_state_dict(q_net.state_dict())
+
+                if ep % args.eval_every == 0 or ep == args.total_episodes:
+                    log_and_checkpoint(ep, epsilon, rl_lr, sl_lr)
     except KeyboardInterrupt:
         print("Interrupted -- saving checkpoint before exit.", flush=True)
         save_checkpoint(ep)

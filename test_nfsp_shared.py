@@ -112,6 +112,55 @@ def test_history_invariance():
     assert not torch.equal(encode_state(a, CFG)[1], encode_state(c, CFG)[1])  # a real difference still shows
 
 
+def test_liar_history_excludes_current_bid():
+    """The shared_face_liar opponent-history scalars must reflect the opponent's PRIOR bids on
+    the claimed face, not the current bid itself -- bidding alternates, so the current bid is
+    always the opponent's most recent move and would otherwise just echo back cb.quantity."""
+    from nfsp_model import encode_state_shared, S_LIAR_V2
+    cfg = NFSPConfig(dice_count=5, arch="shared_face_liar")
+    # Opponent (pidx=1) bid 3x4, I (pidx=0) bid something unrelated, opponent raised their own
+    # face-4 claim to 6x4 -- it's now my turn, current bid is that 6x4.
+    hist = [(1, Bid(3, 4)), (0, Bid(4, 5)), (1, Bid(6, 4))]
+    state = mkstate([1, 2, 3, 5, 6], cb=Bid(6, 4), hist=hist, my_index=0)
+    static, _ = encode_state_shared(state, cfg)
+    liar = static[S_LIAR_V2]
+    prior_max, prior_times = float(liar[-2]), float(liar[-1])
+    qcap, qmax = cfg.max_quantity + 1, cfg.max_quantity
+    assert round(prior_max * qcap) == 3, f"expected prior max 3 (from the 3x4 bid), got {prior_max * qcap}"
+    assert round(prior_times * qmax) == 1, f"expected prior count 1, got {prior_times * qmax}"
+
+    # No prior bids at all on the claimed face -> both should be zero.
+    state2 = mkstate([1, 2, 3, 5, 6], cb=Bid(2, 2), hist=[(1, Bid(2, 2))], my_index=0)
+    static2, _ = encode_state_shared(state2, cfg)
+    liar2 = static2[S_LIAR_V2]
+    assert float(liar2[-2]) == 0.0 and float(liar2[-1]) == 0.0
+
+
+def test_v2_face_rows_separate_history_from_current_claim():
+    """v2 face rows: opponent max/count per face exclude the current bid, and the current claim's
+    quantity shows up only on the claimed face's row (and only on the face-1 row for a 1s claim)."""
+    from nfsp_model import (FACE1_FEATS_V2, FACE_FEATS_V2, S_FACE1_V2, S_FACES_V2,
+                            encode_state_shared)
+    cfg = NFSPConfig(dice_count=5, arch="shared_face_liar")
+    qcap, qmax = cfg.max_quantity + 1, cfg.max_quantity
+    hist = [(1, Bid(3, 4)), (0, Bid(4, 5)), (1, Bid(6, 4))]
+    static, _ = encode_state_shared(mkstate([1, 2, 3, 5, 6], cb=Bid(6, 4), hist=hist, my_index=0), cfg)
+    rows = static[S_FACES_V2].reshape(5, FACE_FEATS_V2)
+    face4 = rows[4 - 2]
+    assert round(float(face4[6]) * qcap) == 3, "face-4 opponent max should be the prior 3x4, not the current 6x4"
+    assert round(float(face4[7]) * qmax) == 1, "face-4 opponent count should exclude the current bid"
+    assert round(float(face4[-1]) * qcap) == 6, "claimed face's row should carry the current claim quantity"
+    for f in (2, 3, 5, 6):
+        assert float(rows[f - 2][-1]) == 0.0, f"face {f} is not the claimed face; claim column must be 0"
+    face1 = static[S_FACE1_V2]
+    assert len(face1) == FACE1_FEATS_V2 and float(face1[-1]) == 0.0
+
+    # A claim on 1s shows up on the face-1 row instead.
+    static1, _ = encode_state_shared(mkstate([2, 3, 4, 5, 6], cb=Bid(3, 1), hist=[(1, Bid(3, 1))]), cfg)
+    assert round(float(static1[S_FACE1_V2][-1]) * qcap) == 3
+    assert float(static1[S_FACES_V2].reshape(5, FACE_FEATS_V2)[:, -1].abs().sum()) == 0.0
+
+
 def test_min_next_bid_matches_bid_rules():
     for s in collect_states(150):
         static, _ = encode_state(s, CFG)
