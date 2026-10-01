@@ -19,8 +19,8 @@ import torch.nn.functional as F
 
 from game import Bot
 from nfsp_model import NFSPConfig, action_to_bid
-from rnad_net import RNaDNet
-from vec_env import Spec, VecEnv, py_features
+from rnad_net import InfoSetNet, RNaDNet
+from vec_env import STATIC_DIM, Spec, VecEnv, py_features
 
 NEG = float("-inf")
 
@@ -46,10 +46,54 @@ class Config:
     c_bar: float = 1.0
     chunk: int = 8192
     shaping: float = 0.0         # potential-based reward shaping on dice counts (0 = off, paper-faithful)
+    # Options added to match DeepMind's reference implementation (open_spiel rnad.py). The defaults
+    # keep the original behaviour so older checkpoints resume unchanged; train_rnad --preset reference
+    # switches them on.
+    net: str = "face"            # "face": RNaDNet; "infoset": MLP on the exact information set (reference)
+    hidden: int = 256            # InfoSetNet torso width
+    reg_reward: str = "sampled"  # penalty in the reward stream: "sampled" log-ratio of the taken action (paper's
+                                 # equations) or "expected" KL(pi || pi_reg) at each step (reference code)
+    loss_norm: str = "global"    # "global": mean over all rows; "per_player": mean per player, summed (reference);
+                                 # "infoset": policy loss averaged per distinct information set in the batch, so
+                                 # every visited infoset takes the same-size step (value loss stays per player)
+    sched_sizes: tuple = ()      # delta_m schedule as in the reference's EntropySchedule; empty -> (iter_steps,)
+    sched_repeats: tuple = ()
 
     @property
     def spec(self) -> Spec:
         return Spec(dice=self.dice, window=self.window)
+
+
+class EntropySchedule:
+    """The reference implementation's schedule of regularization-policy updates.
+
+    EntropySchedule([3, 5, 10], [2, 4, 1]) updates after steps [3, 6, 11, 16, 21, 26, 36, ...]:
+    two iterations of size 3, four of size 5, then size 10 forever (the last repeat must be 1).
+    """
+
+    def __init__(self, sizes, repeats):
+        if len(sizes) != len(repeats) or not sizes or any(r <= 0 for r in repeats) or repeats[-1] != 1:
+            raise ValueError(f"bad entropy schedule: sizes={sizes} repeats={repeats}")
+        sched = [0]
+        for size, rep in zip(sizes, repeats):
+            sched.extend([sched[-1] + (i + 1) * size for i in range(rep)])
+        self.schedule = sched
+
+    def iteration(self, step: int):
+        """(index, start, size) of the R-NaD iteration that contains learner step `step` (0-based)."""
+        sch = self.schedule
+        if step >= sch[-1]:
+            size = sch[-1] - sch[-2]
+            k = (step - sch[-1]) // size
+            return len(sch) - 1 + k, sch[-1] + k * size, size
+        k = max(i for i, s in enumerate(sch) if s <= step)
+        return k, sch[k], sch[k + 1] - sch[k]
+
+    def __call__(self, step: int):
+        """(alpha, update_after_this_step): alpha mixes the newest regularization policy with the one
+        before (min(1, 2 n / size)); the regularization policy is replaced after the iteration's last step."""
+        _, start, size = self.iteration(step)
+        return min(1.0, 2.0 * (step - start) / size), step > 0 and step == start + size - 1
 
 
 class Traj:
@@ -66,7 +110,7 @@ class Traj:
 def collect(env: VecEnv, net: RNaDNet, shaping: float = 0.0) -> Traj:
     env.reset()
     active = torch.arange(env.n)
-    keys = ("env", "static", "win", "wmask", "mask", "act", "logmu", "player", "final", "shape")
+    keys = ("env", "static", "win", "wmask", "mask", "act", "logmu", "logmu_all", "player", "final", "shape")
     rec = {k: [] for k in keys}
     offsets, total = [0], 0
     winner = torch.full((env.n,), -1, dtype=torch.long)
@@ -77,7 +121,8 @@ def collect(env: VecEnv, net: RNaDNet, shaping: float = 0.0) -> Traj:
         a = torch.multinomial(logp.exp(), 1).squeeze(1)
         done, w, shape = env.step(active, a, shaping)
         for k, v in zip(keys, (active, obs.static, obs.win, obs.wmask, obs.mask, a,
-                               logp.gather(1, a[:, None]).squeeze(1), obs.player, done, shape)):
+                               logp.gather(1, a[:, None]).squeeze(1), logp.masked_fill(~obs.mask, 0.0),
+                               obs.player, done, shape)):
             rec[k].append(v)
         winner[active[done]] = w[done]
         total += active.numel()
@@ -138,14 +183,18 @@ class NFSPReg:
         return torch.log_softmax(logits, -1).masked_fill(~mask, 0.0)
 
 
-def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_bar=1.0, c_bar=1.0):
+def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_bar=1.0, c_bar=1.0, pen=None):
     """The paper's two-player v-trace, computed backward over whole games without bootstrapping.
 
+    `pen` is the regularization penalty paid by the acting player at each row (and received by the other
+    player); by default eta * log(pi/pi_reg) of the sampled action, as in the paper's equations. The
+    reference code passes eta * KL(pi || pi_reg) instead, its expectation over actions (lower variance).
     Returns (vh_row, gm_row): the value target for each decision's acting player, and
     (return-to-go estimate - v) used to build the importance-weighted Q estimate.
     """
     S, n = traj.S, traj.n_envs
-    pen = eta * (logpi_taken - logreg_taken)
+    if pen is None:
+        pen = eta * (logpi_taken - logreg_taken)
     r_env = traj.shape.clone()
     fin = traj.final
     r_env[fin] += torch.where(traj.winner[traj.env[fin]] == traj.player[fin], 1.0, -1.0)
@@ -170,10 +219,16 @@ def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_b
     return vh_row, gm_row
 
 
+def build_net(cfg: Config):
+    if cfg.net == "infoset":
+        return InfoSetNet(cfg.spec, cfg.hidden)
+    return RNaDNet(cfg.spec, cfg.gru_hidden, cfg.score_hidden)
+
+
 class RNaD:
     def __init__(self, cfg: Config):
         self.cfg, self.spec = cfg, cfg.spec
-        self.net = RNaDNet(self.spec, cfg.gru_hidden, cfg.score_hidden)
+        self.net = build_net(cfg)
         self.target = copy.deepcopy(self.net)
         for p in self.target.parameters():
             p.requires_grad_(False)
@@ -181,6 +236,7 @@ class RNaD:
         self.env = VecEnv(self.spec, cfg.games_per_step)
         self.reg_cur, self.reg_prev = UniformReg(), UniformReg()
         self.step_count, self.iter, self.n_in_iter = 0, 0, 0
+        self.schedule = EntropySchedule(tuple(cfg.sched_sizes) or (cfg.iter_steps,), tuple(cfg.sched_repeats) or (1,))
 
     def distill(self, reg, steps: int, lr: float = 1e-3, games: int = 512, log=print) -> None:
         """Supervised warm start: fit the online policy to `reg` on states reached by playing `reg`
@@ -213,7 +269,7 @@ class RNaD:
 
     @property
     def alpha(self) -> float:
-        return min(1.0, 2.0 * self.n_in_iter / self.cfg.iter_steps)
+        return self.schedule(self.step_count)[0]
 
     def learn_step(self) -> dict:
         cfg, spec = self.cfg, self.spec
@@ -225,11 +281,27 @@ class RNaD:
         v = chunked(lambda s, w, m: self.target.value(s, w, m), cfg.chunk, traj.static, traj.win, traj.wmask)
         regf = lambda reg: chunked(reg.log_probs, cfg.chunk, traj.static, traj.win, traj.wmask, traj.mask)
         logreg = regf(self.reg_cur)
-        alpha = self.alpha
+        alpha, update_reg = self.schedule(self.step_count)
         if alpha < 1.0:
             logreg = alpha * logreg + (1.0 - alpha) * regf(self.reg_prev)
         logreg_taken = logreg.gather(1, traj.act[:, None]).squeeze(1)
-        vh, gm = two_player_vtrace(traj, v, traj.logmu, logreg_taken, cfg.eta, None, cfg.rho_bar, cfg.c_bar)
+        pen = None
+        if cfg.reg_reward == "expected":                        # on-policy: the behaviour policy is pi itself
+            mu = traj.logmu_all.exp() * traj.mask
+            pen = cfg.eta * (mu * (traj.logmu_all - logreg)).sum(-1)
+        vh, gm = two_player_vtrace(traj, v, traj.logmu, logreg_taken, cfg.eta, None, cfg.rho_bar, cfg.c_bar, pen)
+        if cfg.loss_norm in ("per_player", "infoset"):          # mean over each player's steps, summed over players
+            n_p = torch.bincount(traj.player, minlength=2).clamp(min=1).float()
+            wrow = 1.0 / n_p[traj.player]
+        else:
+            wrow = torch.full((S,), 1.0 / S)
+        wpol = wrow
+        if cfg.loss_norm == "infoset":                          # each distinct infoset's rows share weight 1/n_infosets(player)
+            key = torch.cat([traj.player[:, None].float(), traj.static[:, STATIC_DIM:]], 1)
+            _, inv, cnt = torch.unique(key, dim=0, return_inverse=True, return_counts=True)
+            first = torch.zeros(cnt.shape[0], dtype=torch.long).scatter_(0, inv, traj.player)
+            n_inf = torch.bincount(first, minlength=2).clamp(min=1).float()
+            wpol = 1.0 / (cnt[inv].float() * n_inf[traj.player])
 
         self.opt.zero_grad()
         acc = dict(pol=0.0, val=0.0, kl=0.0, ent=0.0, adv=0.0)
@@ -259,25 +331,27 @@ class RNaD:
             val_loss = 0.5 * (value - vh[sl]) ** 2
             q_loss = 0.5 * (qv.gather(1, traj.act[sl][:, None]).squeeze(1) - (gm[sl] + v[sl])) ** 2 \
                 if cfg.adv_mode == "critic" else torch.zeros_like(val_loss)
-            ((pol_loss + cfg.value_coef * val_loss + cfg.q_coef * q_loss).sum() / S).backward()
+            (wpol[sl] * pol_loss + wrow[sl] * (cfg.value_coef * val_loss + cfg.q_coef * q_loss)).sum().backward()
             with torch.no_grad():
                 acc["pol"] += float(pol_loss.sum())
                 acc["val"] += float(val_loss.sum())
                 acc["kl"] += float((pi * (logpi - logreg[sl])).sum())
                 acc["ent"] += float(-(pi * logpi).sum())
                 acc["adv"] += float((adv.abs() * mask).sum() / nl.mean())
-        gn = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
+        if cfg.grad_clip > 0:
+            gn = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
+        else:
+            gn = torch.norm(torch.stack([p.grad.norm() for p in self.net.parameters() if p.grad is not None]))
         self.opt.step()
         with torch.no_grad():
             for pt, pn in zip(self.target.parameters(), self.net.parameters()):
                 pt.mul_(1.0 - cfg.gamma).add_(pn, alpha=cfg.gamma)
 
-        self.step_count += 1
-        self.n_in_iter += 1
-        if self.n_in_iter >= cfg.iter_steps:
+        if update_reg:
             self.reg_prev, self.reg_cur = self.reg_cur, NetReg(self.target)
-            self.iter += 1
-            self.n_in_iter = 0
+        self.step_count += 1
+        self.iter, start, _ = self.schedule.iteration(self.step_count)
+        self.n_in_iter = self.step_count - start
         return dict(rows=S, games=traj.n_envs, len=S / traj.n_envs, kl=acc["kl"] / S, ent=acc["ent"] / S,
                     val=acc["val"] / S, pol=acc["pol"] / S, gn=float(gn), t_roll=t1 - t0, t_learn=time.time() - t1,
                     seat0=float((traj.winner == 0).float().mean()))
@@ -342,7 +416,7 @@ def load_policy_net(path, which="target"):
     """Load the deployable network from a checkpoint saved by train_rnad.py."""
     sd = torch.load(path, map_location="cpu")
     cfg = Config(**sd["cfg"])
-    net = RNaDNet(cfg.spec, cfg.gru_hidden, cfg.score_hidden)
+    net = build_net(cfg)
     net.load_state_dict(sd[which])
     net.eval()
     return net, cfg

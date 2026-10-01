@@ -39,6 +39,11 @@ class Spec:
     def max_hist(self) -> int:
         return 6 * self.qmax + 4
 
+    @property
+    def info_dim(self) -> int:
+        """Width of the exact per-round information-set encoding appended after the STATIC_DIM features."""
+        return 6 + 2 + self.n_raise + 1
+
 
 def legal_mask(spec: Spec, cq: torch.Tensor, cf: torch.Tensor) -> torch.Tensor:
     """Legal actions [n, n_actions] given the standing bid (cf == 0 means no bid yet)."""
@@ -55,10 +60,25 @@ def legal_mask(spec: Spec, cq: torch.Tensor, cf: torch.Tensor) -> torch.Tensor:
     return torch.cat([raise_ok.reshape(n, -1), liar_ok[:, None]], dim=1)
 
 
+def info_features(spec, counts, hand, opp, hq, hf, hlen, opener, p):
+    """Exact information set of the current round: own dice per face, both dice counts, the set of bids
+    made this round (bids strictly increase, so the set fixes their order; who made each follows from
+    the opener), and whether I opened. [n, spec.info_dim]."""
+    n, dc = counts.shape[0], float(spec.dice)
+    H = hq.shape[1]
+    ar = torch.arange(H, device=counts.device)[None, :]
+    ok = (ar < hlen[:, None]) & (hq >= 1) & (hq <= spec.qmax) & (hf >= 1)
+    idx = ((hq - 1).clamp(0, spec.qmax - 1) * 6 + (hf - 1).clamp(0, 5)) * ok
+    made = torch.zeros(n, spec.n_raise, device=counts.device).scatter_add_(1, idx, ok.float()).clamp(max=1.0)
+    return torch.cat([counts[:, 1:7].float() / dc, (hand.float() / dc)[:, None], (opp.float() / dc)[:, None],
+                      made, (opener == p).float()[:, None]], dim=1)
+
+
 def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask):
     """counts [n,7] (index = face 1..6); hand/opp/cq/cf/hlen/opener/p [n]; hq/hf [n,H]; mask [n,A].
 
-    Returns static [n,STATIC_DIM], win [n,K,bid_dim], wmask [n,K] (True where a real bid sits).
+    Returns static [n, STATIC_DIM + info_dim], win [n,K,bid_dim], wmask [n,K] (True where a real bid
+    sits). Columns past STATIC_DIM hold info_features; the face-shared nets only read the first STATIC_DIM.
     """
     n = counts.shape[0]
     dev = counts.device
@@ -124,7 +144,8 @@ def make_features(spec, counts, hand, opp, cq, cf, hq, hf, hlen, opener, p, mask
     ], dim=-1) * hasf[:, None]
     claim = F.one_hot(cfs - 1, 6).float() * hasf[:, None]
     glob = torch.stack([handf / dc, oppf / dc, c1f / dc, hasf], dim=-1)
-    static = torch.cat([glob, faces.reshape(n, 50), face1, liar, claim], dim=-1)
+    static = torch.cat([glob, faces.reshape(n, 50), face1, liar, claim,
+                        info_features(spec, counts, hand, opp, hq, hf, hlen, opener, p)], dim=-1)
 
     K = spec.window
     j = torch.arange(K, device=dev)[None, :]
@@ -253,6 +274,17 @@ def py_features(state, spec: Spec):
     cfg = NFSPConfig(dice_count=spec.dice, arch="shared_face")
     mask = legal_action_mask(state, cfg)
     static, seq = encode_state_shared(state, cfg, mask)
+    counts = torch.zeros(1, 7, dtype=torch.long)
+    for d in state.my_dice:
+        counts[0, d] += 1
+    hist = state.bid_history
+    hq = torch.tensor([[b.quantity for _, b in hist] or [0]])
+    hf = torch.tensor([[b.face for _, b in hist] or [0]])
+    opener = hist[0][0] if hist else state.my_index
+    info = info_features(spec, counts, torch.tensor([len(state.my_dice)]),
+                         torch.tensor([state.dice_counts[1 - state.my_index]]), hq, hf,
+                         torch.tensor([len(hist)]), torch.tensor([opener]), torch.tensor([state.my_index]))
+    static = torch.cat([static, info[0]])
     K, m = spec.window, min(spec.window, len(state.bid_history))
     win = torch.zeros(K, spec.bid_dim)
     wmask = torch.zeros(K, dtype=torch.bool)

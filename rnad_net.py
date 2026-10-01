@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vec_env import S_CLAIM, S_FACE1, S_FACES, S_GLOBAL, S_LIAR, Spec
+from vec_env import S_CLAIM, S_FACE1, S_FACES, S_GLOBAL, S_LIAR, STATIC_DIM, Spec
 
 FACE_EMB, Q_EMB, SCORE_HIDDEN, LIAR_HIDDEN, VALUE_HIDDEN = 16, 8, 64, 32, 64
 
@@ -93,3 +93,35 @@ class RNaDNet(nn.Module):
     def forward(self, static, win, wmask, mask):
         parts = self.parts(static, win, wmask)
         return self.policy_logits(static, win, wmask, mask, parts), self.value(static, win, wmask, parts)
+
+
+class InfoSetNet(nn.Module):
+    """The reference implementation's architecture: an MLP torso (two ReLU layers) on the exact per-round
+    information-set encoding (vec_env.info_features, stored after STATIC_DIM in `static`), with a linear
+    policy head and a linear value head. Same interface as RNaDNet; `win`/`wmask` are unused."""
+
+    def __init__(self, spec: Spec, hidden: int = 256):
+        super().__init__()
+        self.spec = spec
+        self.torso = nn.Sequential(nn.Linear(spec.info_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU())
+        self.pi_head = nn.Linear(hidden, spec.n_actions)
+        self.v_head = nn.Linear(hidden, 1)
+
+    def parts(self, static, win, wmask):
+        return self.torso(static[:, STATIC_DIM:])
+
+    def heads(self, static, win, wmask, mask, parts=None):
+        h = parts if parts is not None else self.parts(static, win, wmask)
+        logits = self.pi_head(h)
+        return logits, torch.zeros_like(logits)
+
+    def policy_logits(self, static, win, wmask, mask, parts=None):
+        return self.heads(static, win, wmask, mask, parts)[0]
+
+    def value(self, static, win, wmask, parts=None):
+        h = parts if parts is not None else self.parts(static, win, wmask)
+        return self.v_head(h).squeeze(-1)
+
+    def forward(self, static, win, wmask, mask):
+        h = self.parts(static, win, wmask)
+        return self.policy_logits(static, win, wmask, mask, h), self.value(static, win, wmask, h)

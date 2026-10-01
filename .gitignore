@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 checkpoints/
 train_nfsp*.log
+cfr_d1_policy.npy

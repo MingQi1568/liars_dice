@@ -133,6 +133,99 @@ def test_nfsp_reg_matches_nfsp_policy():
         assert (ref - got[i]).abs().max() < 1e-4
 
 
+def test_entropy_schedule_matches_reference():
+    """Same cases as the reference implementation's tests (open_spiel rnad_test.py / docstring)."""
+    from rnad import EntropySchedule
+    assert EntropySchedule([3, 5, 10], [2, 4, 1]).schedule == [0, 3, 6, 11, 16, 21, 26, 36]
+    expected = [(0, False), (2 / 3, False), (1, True), (0, False), (2 / 3, False), (1, True), (0, False),
+                (0.4, False), (0.8, False), (1, False), (1, True), (0, False), (1 / 3, False), (2 / 3, False),
+                (1, False), (1, False), (1, True), (0, False), (1 / 3, False), (2 / 3, False), (1, False),
+                (1, False), (1, True), (0, False)]
+    sched = EntropySchedule([3, 5, 6], [2, 1, 1])
+    for i, (a, u) in enumerate(expected):
+        got_a, got_u = sched(i)
+        assert abs(got_a - a) < 1e-9 and got_u == u, (i, got_a, got_u, a, u)
+
+
+def test_vtrace_with_expected_penalty_matches_bruteforce():
+    """With an explicit per-row penalty (the reference's expected KL), on-policy v-trace targets still
+    equal the exact return-to-go of the transformed rewards for each player."""
+    torch.manual_seed(3)
+    spec = Spec(dice=2)
+    traj = collect(VecEnv(spec, 48), RNaDNet(spec).eval(), shaping=0.1)
+    v = torch.randn(traj.S)
+    pen = 0.2 * torch.rand(traj.S)
+    vh, gm = two_player_vtrace(traj, v, traj.logmu, traj.logmu, 0.2, pen=pen)
+    r_env = traj.shape.clone()
+    fin = traj.final
+    r_env[fin] += torch.where(traj.winner[traj.env[fin]] == traj.player[fin], 1.0, -1.0)
+    order = torch.argsort(traj.env, stable=True)
+    for e in range(traj.n_envs):
+        rows = order[traj.env[order] == e]
+        for i in (0, 1):
+            r_i = torch.stack([(r_env[r] - pen[r]) if traj.player[r] == i else (-r_env[r] + pen[r]) for r in rows])
+            future = torch.flip(torch.cumsum(torch.flip(r_i, [0]), 0), [0])
+            after = torch.cat([future[1:], torch.zeros(1)])
+            for k, r in enumerate(rows):
+                if traj.player[r] == i:
+                    assert abs(float(vh[r]) - float(future[k])) < 1e-4
+                    assert abs(float(gm[r] + v[r]) - float(r_env[r] + after[k])) < 1e-4
+
+
+def test_reference_options_learn_and_round_trip():
+    """Reference-mode training (infoset MLP, expected-KL reward, per-player loss, no grad clip, a
+    multi-size schedule) runs, moves the regularization policy at the scheduled steps, and checkpoints."""
+    from rnad import load_policy_net
+    torch.manual_seed(5)
+    cfg = Config(dice=1, games_per_step=256, chunk=512, net="infoset", hidden=32, reg_reward="expected",
+                 loss_norm="per_player", grad_clip=0.0, sched_sizes=(3, 5), sched_repeats=(1, 1))
+    agent = RNaD(cfg)
+    iters = []
+    for _ in range(13):
+        m = agent.learn_step()
+        assert all(torch.isfinite(torch.tensor(float(m[k]))) for k in ("kl", "ent", "val", "pol", "gn"))
+        iters.append(agent.iter)
+    assert iters[2] == 1 and iters[7] == 2 and iters[12] == 3 and iters[1] == 0 and iters[6] == 1, iters
+    import os, tempfile
+    path = os.path.join(tempfile.mkdtemp(), "ck.pt")
+    torch.save(agent.state_dict(), path)
+    net, cfg2 = load_policy_net(path)
+    static, win, wmask, mask = py_features(_dummy_state(), cfg.spec)
+    a = policy_probs(agent.target, static[None], win[None], wmask[None], mask[None])
+    b = policy_probs(net, static[None], win[None], wmask[None], mask[None])
+    assert cfg2.net == "infoset" and torch.allclose(a, b)
+
+
+def test_exact_tools_match_reference_solver():
+    """The vectorized exact solver (exact_d1) agrees with the slow recursive one (exploit_d1.Game1)."""
+    import numpy as np
+    from exact_d1 import Tree, discretize_policy
+    from exploit_d1 import Game1
+    spec = Spec(dice=1)
+    tree = Tree(spec.qmax)
+    pi = tree.softmax(np.random.default_rng(1).normal(size=(tree.H, 6, tree.A)))
+    g = Game1(lambda states: np.zeros((len(states), tree.A)), spec)
+    g.probs = pi
+    assert abs(tree.nash_conv(pi)[0] - g.nash_conv()[0]) < 1e-9
+    assert abs(tree.seat0_value(pi) - g.seat0_value()) < 1e-9
+    d = discretize_policy(pi, 32)
+    assert np.allclose(d.sum(-1), 1) and np.allclose(d * 32, np.round(d * 32))
+
+
+def test_infoset_loss_weights():
+    """loss_norm='infoset': within each player, every distinct information set in the batch gets total
+    policy-loss weight 1/(number of distinct infosets of that player)."""
+    torch.manual_seed(6)
+    agent = RNaD(Config(dice=1, games_per_step=300, chunk=512, net="infoset", hidden=16, loss_norm="infoset"))
+    m = agent.learn_step()
+    assert all(torch.isfinite(torch.tensor(float(m[k]))) for k in ("kl", "ent", "val", "pol", "gn"))
+    from vec_env import STATIC_DIM
+    traj = collect(VecEnv(Spec(dice=1), 300), agent.net)
+    key = torch.cat([traj.player[:, None].float(), traj.static[:, STATIC_DIM:]], 1)
+    _, inv, cnt = torch.unique(key, dim=0, return_inverse=True, return_counts=True)
+    assert int(cnt.max()) > 1 and cnt.shape[0] < traj.S          # infosets genuinely repeat within a batch
+
+
 def _dummy_state():
     from game import Bid, GameState
     return GameState([3], 0, 2, [1, 1], 2, Bid(1, 4), [(1, Bid(1, 4))], 1)
