@@ -2,9 +2,11 @@
 
     python3 diag_d1.py cfr       [iters]                    # CFR+ reference equilibrium -> cfr_d1_policy.npy
     python3 diag_d1.py oracle    eta inner outer [visit]    # exact tabular R-NaD, NashConv per outer iteration
-    python3 diag_d1.py floor     face|infoset [steps]       # distill the CFR+ policy into a network: its NashConv floor
+    python3 diag_d1.py floor     VARIANT [steps]            # distill the CFR+ policy into a network: its NashConv floor
+                                                            # VARIANT: infoset | face | face+rank | face+ctx | face+rank+ctx
     python3 diag_d1.py patch     CHECKPOINT                 # where is a trained policy exploitable? (needs cfr)
     python3 diag_d1.py finetune  CHECKPOINT                 # NashConv raw / thresholded / thresholded+discretized
+    python3 diag_d1.py liar      CHECKPOINT|POLICY.npy ...  # is the error in the liar decision or among raises? (needs cfr)
 """
 import sys
 import time
@@ -48,13 +50,15 @@ def cmd_oracle(eta, inner, outer, weighting="infoset"):
                log=lambda s: print(f"{s} [{time.time() - t0:.0f}s]", flush=True))
 
 
-def cmd_floor(kind, steps=3000):
+def cmd_floor(kind, steps=3000, save=None):
     from rnad_net import InfoSetNet, RNaDNet
     torch.manual_seed(0)
     target = np.load(CFR_PATH)
     static, win, wmask, mask = (torch.stack(x) for x in zip(*[py_features(s, SPEC) for s in states()]))
     tgt = torch.tensor(target.reshape(-1, TREE.A), dtype=torch.float32)
-    net = InfoSetNet(SPEC, 256) if kind == "infoset" else RNaDNet(SPEC)
+    net = InfoSetNet(SPEC, 256) if kind == "infoset" else \
+        RNaDNet(SPEC, face_rank="rank" in kind, info_ctx=64 if "ctx" in kind else 0)
+    print(f"{kind}: {sum(p.numel() for p in net.parameters())} parameters", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3 if kind == "infoset" else 2e-3)
     for k in range(1, steps + 1):
         logp = torch.log_softmax(net.policy_logits(static, win, wmask, mask).masked_fill(~mask, float("-inf")), -1)
@@ -66,6 +70,8 @@ def cmd_floor(kind, steps=3000):
             p = logp.detach().exp().numpy().astype(np.float64).reshape(TREE.H, 6, TREE.A)
             print(f"{kind} step {k}: KL {kl.item():.5f} NashConv {TREE.nash_conv(p / p.sum(-1, keepdims=True))[0]:.4f}",
                   flush=True)
+    if save:
+        np.save(save, p / p.sum(-1, keepdims=True))
 
 
 def cmd_patch(path):
@@ -78,6 +84,45 @@ def cmd_patch(path):
             m = sel(tau)
             nc = TREE.nash_conv(np.where(m[:, :, None], star, pi))[0]
             print(f"  tau {tau:.0e}: {m.mean():6.1%} of infosets, {vis[m].sum() / vis.sum():6.2%} of visits -> NashConv {nc:.4f}")
+
+
+def load_policy(path):
+    return np.load(path) if path.endswith(".npy") else ckpt_policy(path)
+
+
+def swap_liar(pi, star):
+    """pi with its probability of calling liar replaced by star's; raises keep pi's relative preferences."""
+    R = TREE.R
+    out = pi.copy()
+    has = TREE.legal[:, R][:, None] & (pi[..., :R].sum(-1) > 0)
+    scale = (1.0 - star[..., R]) / np.maximum(pi[..., :R].sum(-1), 1e-300)
+    out[..., :R] = np.where(has[..., None], pi[..., :R] * scale[..., None], pi[..., :R])
+    out[..., R] = np.where(has, star[..., R], pi[..., R])
+    return out
+
+
+def swap_raises(pi, star):
+    """pi with its choice AMONG raises replaced by star's relative preferences; P(liar) kept from pi."""
+    R = TREE.R
+    out = pi.copy()
+    sr = star[..., :R].sum(-1)
+    ok = sr > 1e-12
+    mass = 1.0 - pi[..., R]
+    out[..., :R] = np.where(ok[..., None], star[..., :R] / np.maximum(sr, 1e-300)[..., None] * mass[..., None], pi[..., :R])
+    return out
+
+
+def cmd_liar(*paths):
+    star = np.load(CFR_PATH)
+    R = TREE.R
+    for path in paths:
+        pi = load_policy(path)
+        vis = TREE.visitation(pi)
+        m = TREE.legal[:, R][:, None] & np.ones((1, 6), bool)
+        err = np.abs(pi[..., R] - star[..., R])
+        print(f"{path}\n  NashConv {TREE.nash_conv(pi)[0]:.4f} | fix only P(liar) -> {TREE.nash_conv(swap_liar(pi, star))[0]:.4f} | "
+              f"fix only the choice among raises -> {TREE.nash_conv(swap_raises(pi, star))[0]:.4f}\n"
+              f"  visit-weighted mean |P(liar) - CFR+| = {(vis * err * m).sum() / (vis * m).sum():.4f}", flush=True)
 
 
 def cmd_finetune(path):
@@ -94,9 +139,11 @@ if __name__ == "__main__":
     elif cmd == "oracle":
         cmd_oracle(float(rest[0]), int(rest[1]), int(rest[2]), *(rest[3:4]))
     elif cmd == "floor":
-        cmd_floor(rest[0], *(int(x) for x in rest[1:2]))
+        cmd_floor(rest[0], *(int(x) for x in rest[1:2]), *(rest[2:3]))
     elif cmd == "patch":
         cmd_patch(rest[0])
+    elif cmd == "liar":
+        cmd_liar(*rest)
     elif cmd == "finetune":
         cmd_finetune(rest[0])
     else:

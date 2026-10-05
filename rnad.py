@@ -51,6 +51,12 @@ class Config:
     # switches them on.
     net: str = "face"            # "face": RNaDNet; "infoset": MLP on the exact information set (reference)
     hidden: int = 256            # InfoSetNet torso width
+    center: str = "legal"        # NeuRD logit centering: mean over "legal" actions, or over "all" actions (reference)
+    adam_eps: float = 1e-8       # reference: 1e-7 (optax eps=10e-8)
+    init: str = "torch"          # "torch" default init, or "haiku": truncated normal std 1/sqrt(fan_in), zero bias
+    init_reg: str = "uniform"    # initial regularization policy: "uniform", or "net" = the initial network (reference)
+    face_rank: bool = False      # RNaDNet: face-rank inputs to the shared per-face MLP
+    info_ctx: int = 0            # RNaDNet: width of the exact-round-encoding context MLP (0 = off)
     reg_reward: str = "sampled"  # penalty in the reward stream: "sampled" log-ratio of the taken action (paper's
                                  # equations) or "expected" KL(pi || pi_reg) at each step (reference code)
     loss_norm: str = "global"    # "global": mean over all rows; "per_player": mean per player, summed (reference);
@@ -222,19 +228,50 @@ def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_b
 def build_net(cfg: Config):
     if cfg.net == "infoset":
         return InfoSetNet(cfg.spec, cfg.hidden)
-    return RNaDNet(cfg.spec, cfg.gru_hidden, cfg.score_hidden)
+    return RNaDNet(cfg.spec, cfg.gru_hidden, cfg.score_hidden, cfg.face_rank, cfg.info_ctx)
+
+
+def vtrace_advantage(pi, pen, act, logmu, gm):
+    """Advantage of each action from the paper's importance-weighted Q estimate (eq. 5):
+    Q(a) = -pen(a) + 1[a = taken] / mu(taken) * gm, minus its expectation under pi."""
+    onehot = F.one_hot(act, pi.shape[-1]).float()
+    q_hat = -pen + onehot / logmu.exp()[:, None] * gm[:, None]
+    return q_hat - (pi * q_hat).sum(-1, keepdim=True)
+
+
+def neurd_loss(logits, mask, adv, beta, center="legal"):
+    """Per-row NeuRD loss: push centered logits along the advantage, but only while they stay within
+    [-beta, beta] of the center (the reference's apply_force_with_threshold). center="legal" uses the mean
+    of the legal logits; "all" divides their sum by the number of actions, as the reference does."""
+    n = mask.sum(-1, keepdim=True).float() if center == "legal" else float(mask.shape[-1])
+    lc = logits - (logits * mask).sum(-1, keepdim=True) / n
+    force = torch.where(adv > 0, lc < beta, lc > -beta)
+    return -(mask * force * lc * adv).sum(-1)
+
+
+def haiku_init_(net):
+    """Haiku's default Linear init (the reference network's): truncated normal, std 1/sqrt(fan_in), zero bias."""
+    for m in net.modules():
+        if isinstance(m, torch.nn.Linear):
+            std = 1.0 / math.sqrt(m.in_features)
+            torch.nn.init.trunc_normal_(m.weight, std=std, a=-2 * std, b=2 * std)
+            torch.nn.init.zeros_(m.bias)
 
 
 class RNaD:
     def __init__(self, cfg: Config):
         self.cfg, self.spec = cfg, cfg.spec
         self.net = build_net(cfg)
+        if cfg.init == "haiku":
+            haiku_init_(self.net)
         self.target = copy.deepcopy(self.net)
         for p in self.target.parameters():
             p.requires_grad_(False)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(0.0, 0.999), eps=1e-8)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr, betas=(0.0, 0.999), eps=cfg.adam_eps)
         self.env = VecEnv(self.spec, cfg.games_per_step)
         self.reg_cur, self.reg_prev = UniformReg(), UniformReg()
+        if cfg.init_reg == "net":                              # reference: regularize toward the initial network
+            self.reg_cur = self.reg_prev = NetReg(self.net)
         self.step_count, self.iter, self.n_in_iter = 0, 0, 0
         self.schedule = EntropySchedule(tuple(cfg.sched_sizes) or (cfg.iter_steps,), tuple(cfg.sched_repeats) or (1,))
 
@@ -320,14 +357,10 @@ class RNaD:
                     qd = qv.detach() * mask
                     adv = (qd - (pi * qd).sum(-1, keepdim=True)) - (pen - (pi * pen).sum(-1, keepdim=True))
                 else:
-                    onehot = F.one_hot(traj.act[sl], A).float()
-                    q_hat = -pen + onehot / traj.logmu[sl].exp()[:, None] * gm[sl][:, None]
-                    adv = q_hat - (pi * q_hat).sum(-1, keepdim=True)
+                    adv = vtrace_advantage(pi, pen, traj.act[sl], traj.logmu[sl], gm[sl])
                 adv = adv.clamp(-cfg.adv_clip, cfg.adv_clip)
             nl = mask.sum(-1, keepdim=True).float()
-            lc = logits - (logits * mask).sum(-1, keepdim=True) / nl
-            force = torch.where(adv > 0, lc < cfg.beta, lc > -cfg.beta)
-            pol_loss = -(mask * force * lc * adv).sum(-1)
+            pol_loss = neurd_loss(logits, mask, adv, cfg.beta, cfg.center)
             val_loss = 0.5 * (value - vh[sl]) ** 2
             q_loss = 0.5 * (qv.gather(1, traj.act[sl][:, None]).squeeze(1) - (gm[sl] + v[sl])) ** 2 \
                 if cfg.adv_mode == "critic" else torch.zeros_like(val_loss)

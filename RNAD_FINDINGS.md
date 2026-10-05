@@ -11,6 +11,13 @@ Reference: the DeepNash / R-NaD paper (`Mastering Stratego with model-free multi
 reinforcement learning`-family work; local copy was read from `deepnash.pdf`, not
 included in this repo).
 
+> **Read "Reference comparison: the NeuRD centering bug" first.** Every run before it,
+> including all 5-dice runs and the 20-hour production run, centered NeuRD logits over the
+> legal actions instead of over all actions as DeepMind's code does. That one difference
+> causes the degradation-after-reference-resets seen throughout this doc. Conclusions below
+> that blame noise, compute scale or reset timing for it are superseded. Use
+> `train_rnad.py --preset reference`, which now matches the reference implementation.
+
 ## Files added on this branch
 
 - `vec_env.py` — vectorized engine: N games advance in lockstep as tensor ops
@@ -46,9 +53,13 @@ included in this repo).
 - `rnad_net.py` also has `InfoSetNet`: the reference implementation's architecture
   (MLP 256x256 on an exact per-round information-set encoding, `vec_env.info_features`,
   stored after the first 76 feature columns).
-- `train_rnad.py --preset reference` switches on DeepMind's reference settings (see
-  "Where our implementation differed"); defaults are unchanged so old checkpoints
-  resume exactly as before.
+- `train_rnad.py --preset reference` switches on DeepMind's reference settings, including
+  the NeuRD centering fix (see "Reference comparison"); defaults are unchanged so old
+  checkpoints resume exactly as before.
+- `reference_check/` — DeepMind's reference R-NaD, our 1-die rules as an OpenSpiel game,
+  and the side-by-side loss check (needs a separate JAX venv; see its README).
+- `RNaDNet --face-rank --info-ctx N` — face-shared net with face-rank inputs and an MLP over
+  the exact round encoding (see "Network floor").
 - `test_vec_env.py`, `test_rnad.py` — 16 tests total, all passing: differential tests
   of the vectorized engine/features against the original Python engine, brute-force
   checks of the v-trace math (sampled and expected penalty), a Monte-Carlo cross-check
@@ -337,18 +348,18 @@ Reproduce with `diag_d1.py`. CFR+ reference: NashConv 0.00911 (400 it), 0.00441 
   The information-set MLP (`InfoSetNet`) reaches 0.047 after 3,000 steps and is still
   falling. Relevant to any future 5-dice R-NaD run with the face-shared net.
 
-## Reference-config training at 1 die (runs in progress at time of writing)
+## Reference-config training at 1 die (before the centering fix)
 
-`train_rnad.py --dice 1 --preset reference` (InfoSetNet, expected-KL penalty, per-player
-loss, lr 5e-5, eta 0.2, beta 2, clips 1e4, target EMA 0.001, batch 512), ~0.03s/step.
-Exact NashConv (raw):
+`train_rnad.py --dice 1 --preset reference` as it was then (InfoSetNet, expected-KL penalty,
+per-player loss, lr 5e-5, eta 0.2, beta 2, clips 1e4, target EMA 0.001, batch 512), ~0.03s/step,
+**still with legal-action NeuRD centering**. Exact NashConv (raw):
 
-| Run | Δm | best | latest when written |
+| Run | Δm | best | final |
 |---|---|---|---|
-| A: reference | 50k | 0.594 @ 80k | rising to 0.831 @ 190k (iteration 3) |
+| A: reference | 50k | 0.594 @ 80k | 0.901 @ 1M (flat ~0.89 from 250k) |
 | B: reference | 10k | 0.524 @ 30k | 0.648 @ 50k, stopped |
 | C: reference, lr 2e-4 | 10k | 0.639 @ 20k | 0.903 @ 50k, stopped |
-| D: reference + `--loss-norm infoset` | 50k | **0.482 @ 100k** | 0.514 @ 130k |
+| D: reference + `--loss-norm infoset` | 50k | **0.482 @ 100k** | 0.723 @ 1M |
 | E: reference + `--loss-norm infoset` | 10k | 0.706 @ 10k | 0.868 @ 50k, stopped |
 
 `--loss-norm infoset` averages the policy loss per distinct information set in the
@@ -356,27 +367,100 @@ batch (every visited infoset takes an equal step) — the sampled analogue of th
 oracle's per-infoset steps. It helps a little (D vs A) but does not stop the
 degradation. Every sampled run with Δm 10k got worse with each reference reset, the
 same pattern as the 5-dice runs; the exact oracle never degrades, so the likely
-cause is noise frozen into each new reference. Caveat: DeepMind's own Leduc curve
-also rose for a while (~0.4 -> ~0.65) before settling at ~0.2 after ~1M steps, so A and
-D may recover; check their logs (`checkpoints/rnad_d1_ref_dm50k`,
-`checkpoints/rnad_d1_ref_infoset_dm50k`) before drawing conclusions.
+cause is noise frozen into each new reference. **Superseded:** A and D never recovered,
+and the real cause turned out to be the NeuRD centering (next section).
+
+## Reference comparison: the NeuRD centering bug
+
+Tools in `reference_check/` (see its README): DeepMind's reference `rnad.py`, our 1-die rules
+registered as an OpenSpiel game, and a side-by-side loss check.
+
+**Our game as an OpenSpiel game is exact.** OpenSpiel's independent tools give the same
+numbers as `exact_d1.py` to 6 decimals: uniform NashConv 1.563371, our CFR+ policy 0.002546,
+seat-0 value -0.021200. (OpenSpiel's own `liars_dice` differs only in that 6s are wild and 6
+is the highest face; ours has 1s wild and 1 the lowest face.)
+
+**DeepMind's code does not degrade, on either game.** Same settings as our runs (batch 512,
+lr 5e-5, eta 0.2, MLP 256x256), exact NashConv raw [fine-tuned]:
+
+| Run | Game | Δm | 10k | 50k | 100k | final |
+|---|---|---|---|---|---|---|
+| R2 | OpenSpiel liars_dice | 10k | 0.616 | 0.434 | 0.363 | 0.363 [0.266] @ 100k |
+| R1 | OpenSpiel liars_dice | 50k | 0.624 | 0.525 | 0.380 | 0.273 [0.166] @ 300k |
+| O2 | ours | 10k | 0.605 | 0.363 | **0.258** [0.188] | 0.258 @ 100k |
+| O1 | ours | 50k | 0.606 | 0.452 | 0.299 | **0.226 [0.132]** @ 250k |
+
+So the rules were not the problem; our implementation was.
+
+**Side-by-side loss check** (`reference_check/diff_*.py`): one batch from our engine through
+DeepMind's `v_trace` / `get_loss_v` / `get_loss_nerd` and through our training helpers, in
+float64. Value targets and advantages agree to ~1e-15. Exactly two loss differences:
+
+- our value loss is `0.5 * (v - target)^2`, theirs `(v - target)^2` (value gradient 2x);
+- NeuRD centering: ours subtracted the mean of the legal logits, theirs subtracts the sum of
+  the legal logits divided by the number of ALL actions. With all-action centering our logit
+  gradient matches theirs to 5e-17.
+
+Reading the rest of the code found four more differences: weight init (Haiku truncated
+normal, std 1/sqrt(fan_in), zero bias), Adam eps (1e-7), the initial regularization policy
+(the initial network, not uniform), and the input layout (same information).
+
+**Bisect** (our code, our game, Δm 10k, seed 5): all six matched, then each reverted alone.
+Raw NashConv:
+
+| Run | 20k | 40k | 60k | entropy @ 60k |
+|---|---|---|---|---|
+| DeepMind's code (O2) | 0.534 | 0.415 | 0.332 | |
+| ours, all matched | 0.531 | 0.426 | **0.358** | 1.05 |
+| reverted: centering (legal mean) | **0.452** | 0.627 | **0.733** | 0.85 |
+| reverted: value-loss factor | 0.534 | 0.417 | 0.343 | 1.04 |
+| reverted: weight init | 0.594 | 0.445 | 0.357 | 1.00 |
+| reverted: initial reg policy | 0.536 | 0.438 | 0.365 | 1.05 |
+| reverted: Adam eps | 0.537 | 0.417 | 0.348 | 1.04 |
+
+The centering alone reproduces the old failure (early gains, then degradation with entropy
+collapse after a couple of resets); the other four differences don't matter. Why it matters
+(hypothesis, not proven): at a single state both versions move the policy identically; they
+differ in the beta threshold check. All-action centering also limits the overall level of the
+legal logits; legal-mean centering lets all logits drift together, which in a shared network
+can leak into other states.
+
+`--preset reference` now sets `center=all`, `value_coef=2`, `adam_eps=1e-7`, `init=haiku`,
+`init_reg=net`. Config defaults keep the old behaviour so old checkpoints resume unchanged.
+
+**Even the reference doesn't reach Nash here:** it flattens around 0.22-0.26 raw (0.13 with
+fine-tuning) after 100-250k steps, versus CFR+ 0.0026 and the exact oracle 0.0074. That
+matches DeepMind's own Leduc plateau (~0.18) and is the realistic target for sampled R-NaD.
+
+## Network floor and the liar decision (1 die, distilled from CFR+)
+
+`diag_d1.py floor` trains a network directly on the exact CFR+ policy (all 24,576 infosets,
+full batch, 3,000 steps) and measures its NashConv — what the architecture can represent.
+`diag_d1.py liar` replaces only P(liar), or only the choice among raises, with CFR+'s.
+
+| Network | NashConv | fix only P(liar) | fix only raises | avg P(liar) error |
+|---|---|---|---|---|
+| face-shared net (`face`) | 0.283 | 0.151 | 0.163 | 0.067 |
+| + face rank (`--face-rank`) | 0.147 | 0.108 | 0.075 | 0.038 |
+| + round context MLP (`--info-ctx 64`) | 0.130 | 0.093 | 0.071 | 0.025 |
+| + both | 0.113 | 0.109 | **0.030** | 0.014 |
+| `InfoSetNet` | **0.043** | 0.037 | 0.023 | 0.013 |
+
+The face-shared net's floor (~0.28) is mostly fixed by telling the shared face MLP each face's
+rank in the bid order (the only thing distinguishing faces 2-6) and/or adding an MLP over the
+exact round encoding to the context. Rank weights are zero-initialized so the net starts
+exactly face-invariant. With both, the liar decision is as good as `InfoSetNet`'s; the
+remaining gap is in choosing among raises. Single seed; ~±0.02 noise between checkpoints.
 
 ## Suggested next steps
 
-1. **Read the final A and D results** (1M steps). If they recover like DeepMind's Leduc
-   curve, the 1-die gap is mostly a matter of steps; if they keep rising, the
-   reference-reset noise is the real problem.
-2. **Smooth the reference update** instead of hard resets: a running average of past
-   iterates (GARIP) or a parameter-space EMA magnet (EMAgnet, arXiv 2606.23995). Easy
-   to test at 1 die with the exact NashConv eval.
-3. **Try regularized PPO (magnet/MMD)** as a baseline — see the ICLR 2026 correction in
-   the PPO section.
-4. For 5 dice: don't use the face-shared net for R-NaD without fixing its
-   representational floor; `InfoSetNet` works at any dice count
-   (`info_dim = 9 + 12 * dice`).
-5. Older ideas, now lower priority: an approximate best-response probe for 5-dice
-   comparisons (better than heuristic-bot win rate); a cheap-filter hyperparameter
-   search (inner-loop flattening for Δm, a stability gate on lr).
+1. **Re-run 5 dice with the fixed settings** (`--preset reference`, i.e. all-action
+   centering). Every 5-dice conclusion in this doc predates the fix.
+2. **For 5 dice, compare `InfoSetNet` with the face-shared net + `--face-rank --info-ctx 64`**:
+   the face net's weight sharing is a sample-efficiency bet that only pays off at 5 dice.
+3. If R-NaD still plateaus too high: a smoothed reference (GARIP / EMAgnet), or regularized
+   PPO (see the ICLR 2026 note in the PPO section).
+4. Lower priority: an approximate best-response probe for 5-dice comparisons.
 
 ## Checkpoints produced this session (gitignored, not in this PR)
 

@@ -69,7 +69,8 @@ def info_features(spec, counts, hand, opp, hq, hf, hlen, opener, p):
     ar = torch.arange(H, device=counts.device)[None, :]
     ok = (ar < hlen[:, None]) & (hq >= 1) & (hq <= spec.qmax) & (hf >= 1)
     idx = ((hq - 1).clamp(0, spec.qmax - 1) * 6 + (hf - 1).clamp(0, 5)) * ok
-    made = torch.zeros(n, spec.n_raise, device=counts.device).scatter_add_(1, idx, ok.float()).clamp(max=1.0)
+    made = torch.zeros(n, spec.n_raise, device=counts.device)
+    made = made.scatter_add_(1, idx, ok.to(made.dtype)).clamp(max=1.0)
     return torch.cat([counts[:, 1:7].float() / dc, (hand.float() / dc)[:, None], (opp.float() / dc)[:, None],
                       made, (opener == p).float()[:, None]], dim=1)
 

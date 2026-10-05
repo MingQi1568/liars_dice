@@ -14,15 +14,37 @@ from vec_env import S_CLAIM, S_FACE1, S_FACES, S_GLOBAL, S_LIAR, STATIC_DIM, Spe
 FACE_EMB, Q_EMB, SCORE_HIDDEN, LIAR_HIDDEN, VALUE_HIDDEN = 16, 8, 64, 32, 64
 
 
+FACE_RANK = 6           # per-face rank inputs: normalized rank (f-2)/4 plus a one-hot of faces 2..6
+
+
 class RNaDNet(nn.Module):
-    def __init__(self, spec: Spec, gru_hidden: int = 64, score_hidden: int = SCORE_HIDDEN):
+    """face_rank: give the shared per-face MLP the face's rank in the bid order (the only thing that
+    distinguishes faces 2-6; probabilities are symmetric), so it can treat faces differently where the
+    ordering matters while still sharing weights. info_ctx > 0: add a small MLP over the exact round
+    encoding (vec_env.info_features) to the context every head sees - full history with real faces."""
+
+    def __init__(self, spec: Spec, gru_hidden: int = 64, score_hidden: int = SCORE_HIDDEN,
+                 face_rank: bool = False, info_ctx: int = 0):
         super().__init__()
-        self.spec, self.gru_hidden = spec, gru_hidden
-        G = gru_hidden + 4
+        self.spec, self.gru_hidden, self.face_rank, self.info_ctx = spec, gru_hidden, face_rank, info_ctx
+        G = gru_hidden + 4 + info_ctx
         self.G = G
         score_in = G + FACE_EMB + Q_EMB + 2
         self.cell = nn.GRUCell(spec.bid_dim, gru_hidden)
-        self.shared_face_mlp = nn.Sequential(nn.Linear(10, FACE_EMB), nn.ReLU(), nn.Linear(FACE_EMB, FACE_EMB))
+        self.shared_face_mlp = nn.Sequential(nn.Linear(10 + (FACE_RANK if face_rank else 0), FACE_EMB), nn.ReLU(),
+                                             nn.Linear(FACE_EMB, FACE_EMB))
+        if face_rank:
+            rank = torch.cat([torch.arange(5, dtype=torch.float32)[:, None] / 4.0, torch.eye(5)], dim=1)   # (5, 6)
+            self.register_buffer("rank_feats", rank)
+            with torch.no_grad():               # start exactly face-invariant; asymmetry grows only where gradients
+                plain = nn.Linear(10, FACE_EMB)  # push it: rank inputs contribute 0 at init, and the other inputs
+                first = self.shared_face_mlp[0]  # are initialized at the plain 10-input layer's scale
+                first.weight.zero_()
+                first.weight[:, :10].copy_(plain.weight)
+                first.bias.copy_(plain.bias)
+        if info_ctx:
+            self.info_mlp = nn.Sequential(nn.Linear(spec.info_dim, 2 * info_ctx), nn.ReLU(),
+                                          nn.Linear(2 * info_ctx, info_ctx), nn.ReLU())
         self.face1_mlp = nn.Sequential(nn.Linear(8, FACE_EMB), nn.ReLU(), nn.Linear(FACE_EMB, FACE_EMB))
         self.quantity_embedding = nn.Embedding(spec.qmax, Q_EMB)
         self.q_score = nn.Sequential(nn.Linear(score_in, score_hidden), nn.ReLU(), nn.Linear(score_hidden, 2))
@@ -38,8 +60,11 @@ class RNaDNet(nn.Module):
             h = torch.where(wmask[:, k: k + 1], self.cell(win[:, k], h), h)
         scal = static[:, S_GLOBAL]
         ctx = torch.cat([h, scal], dim=-1)
+        if self.info_ctx:
+            ctx = torch.cat([ctx, self.info_mlp(static[:, STATIC_DIM:])], dim=-1)
         fi = static[:, S_FACES].reshape(B, 5, 10)
-        e_f = self.shared_face_mlp(fi)
+        fin = torch.cat([fi, self.rank_feats.expand(B, 5, FACE_RANK)], dim=-1) if self.face_rank else fi
+        e_f = self.shared_face_mlp(fin)
         e_1 = self.face1_mlp(static[:, S_FACE1])
         e_all = torch.cat([e_1[:, None], e_f], dim=1)
         e_claim = (static[:, S_CLAIM][:, :, None] * e_all).sum(1)

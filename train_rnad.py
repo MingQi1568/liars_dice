@@ -33,7 +33,9 @@ def eval_vs_bot(net, spec, make_opp, n_games, threshold):
 # DeepMind's reference R-NaD settings (open_spiel rnad.py / DeepNash Table 2; batch 512 as in the
 # reference's Leduc run). Applied by --preset reference to every flag not given explicitly.
 REFERENCE = dict(net="infoset", reg_reward="expected", loss_norm="per_player", lr=5e-5, eta=0.2, beta=2.0,
-                 adv_clip=1e4, grad_clip=0.0, gamma=0.001, games_per_step=512)
+                 adv_clip=1e4, grad_clip=0.0, gamma=0.001, games_per_step=512,
+                 # found by the side-by-side check against the reference code (RNAD_FINDINGS.md):
+                 center="all", value_coef=2.0, adam_eps=1e-7, init="haiku", init_reg="net")
 
 
 def main():
@@ -58,6 +60,13 @@ def main():
     ap.add_argument("--net", type=str, default="face", choices=["face", "infoset"],
                     help="face: face-shared RNaDNet; infoset: MLP on the exact information set (reference)")
     ap.add_argument("--hidden", type=int, default=256, help="InfoSetNet torso width")
+    ap.add_argument("--center", type=str, default="legal", choices=["legal", "all"], help="NeuRD logit centering")
+    ap.add_argument("--value-coef", type=float, default=1.0, help="weight of 0.5*(v - target)^2 (reference: 2.0)")
+    ap.add_argument("--adam-eps", type=float, default=1e-8)
+    ap.add_argument("--init", type=str, default="torch", choices=["torch", "haiku"])
+    ap.add_argument("--init-reg", type=str, default="uniform", choices=["uniform", "net"])
+    ap.add_argument("--face-rank", action="store_true", help="face net: give the shared face MLP each face's rank")
+    ap.add_argument("--info-ctx", type=int, default=0, help="face net: width of the exact-round context MLP (0 = off)")
     ap.add_argument("--reg-reward", type=str, default="sampled", choices=["sampled", "expected"],
                     help="regularization penalty in the reward stream: sampled log-ratio or expected KL (reference)")
     ap.add_argument("--loss-norm", type=str, default="global", choices=["global", "per_player", "infoset"],
@@ -100,7 +109,9 @@ def main():
 
     cfg = Config(dice=args.dice, score_hidden=args.score_hidden, shaping=args.shaping, games_per_step=args.games_per_step, iter_steps=args.iter_steps, eta=args.eta,
                  lr=args.lr, gamma=args.gamma, beta=args.beta, adv_clip=args.adv_clip, adv_mode=args.adv_mode, q_coef=args.q_coef,
-                 grad_clip=args.grad_clip, chunk=args.chunk, net=args.net, hidden=args.hidden,
+                 grad_clip=args.grad_clip, chunk=args.chunk, net=args.net, hidden=args.hidden, face_rank=args.face_rank, info_ctx=args.info_ctx,
+                 center=args.center, value_coef=args.value_coef, adam_eps=args.adam_eps, init=args.init,
+                 init_reg=args.init_reg,
                  reg_reward=args.reg_reward, loss_norm=args.loss_norm, sched_sizes=sizes, sched_repeats=repeats)
     agent = RNaD(cfg)
     if args.resume:
