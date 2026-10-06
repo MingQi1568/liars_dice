@@ -73,6 +73,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="keep a numbered checkpoint every N steps (0 = at every eval); rnad_latest.pt is always updated")
     ap.add_argument("--eval-games", type=int, default=500, help="games per opponent at each eval (dice 5 only)")
     ap.add_argument("--threshold", type=float, default=0.0, help="drop actions below this probability at eval time")
     ap.add_argument("--init-reg-nfsp", type=str, default=None,
@@ -174,7 +176,8 @@ def main():
                 t0 = time.time()
                 res = evaluate()
                 print(f"  >> eval @ step {s} (iter {agent.iter}): {res} [{time.time() - t0:.0f}s]", flush=True)
-                save(s)
+                keep = not args.save_every or s % args.save_every == 0 or s == args.total_steps
+                save(s if keep else None)
             if args.max_hours and (time.time() - t_start) / 3600 > args.max_hours:
                 print(f"max-hours reached at step {s}; saving and stopping", flush=True)
                 save(s)
