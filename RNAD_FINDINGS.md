@@ -15,8 +15,9 @@ included in this repo).
 > including all 5-dice runs and the 20-hour production run, centered NeuRD logits over the
 > legal actions instead of over all actions as DeepMind's code does. That one difference
 > causes the degradation-after-reference-resets seen throughout this doc. Conclusions below
-> that blame noise, compute scale or reset timing for it are superseded. Use
-> `train_rnad.py --preset reference`, which now matches the reference implementation.
+> that blame noise, compute scale or reset timing for it are superseded. The buggy centering
+> has since been removed and every default now matches the reference implementation, so plain
+> `train_rnad.py` is correct (`--preset reference` is kept only as a no-op for old commands).
 
 ## Summary of findings (as of 2026-10-06)
 
@@ -50,16 +51,18 @@ The detailed sections further down are the record; this is what holds up.
 
 ## Path forward
 
-**A. Fixes before any new training (short):**
-- **Flip the `Config` defaults to the reference-correct values** (`center="all"`,
-  `value_coef=2`, `init="haiku"`, `init_reg="net"`, `adam_eps=1e-7`, expected-KL, per-player
-  loss) and backfill the old values only when loading checkpoints saved without them. Today the
-  defaults still carry the centering bug, which is an easy mistake to make again.
-- **Fix init order:** `init="haiku"` re-randomizes the face net's zero-initialized rank weights
-  (verified), so the face net no longer starts face-invariant under the preset.
-- **Add a golden regression test:** save the side-by-side batch and DeepMind's outputs as a small
-  fixture so the normal test suite checks our losses against the reference without needing JAX.
-- **Push the branch** so the other machine has the fix.
+**A. Fixes before any new training — done (2026-10-06):**
+- The buggy legal-mean centering is removed; NeuRD always centers as the reference does. Every
+  `Config` and CLI default now matches the reference (batch 512, lr 5e-5, eta 0.2, target EMA
+  0.001, expected-KL penalty, per-player loss, value loss `(v - target)^2`, Haiku-style init, the
+  initial network as the first regularization policy, `InfoSetNet`, no grad-norm clip).
+  `config_from_dict` still loads old checkpoints (drops the removed `center` option; checkpoints
+  without `net` are face-net ones); resuming one runs the corrected code.
+- Face-net rank weights stay zero after Haiku-style init (`RNaDNet.face_invariant_start`).
+- Golden regression test `test_matches_reference_losses`: a fixed batch plus DeepMind's outputs
+  (`test_data/reference_losses_d1.npz`, written by `reference_check/make_golden.py`). Verified to
+  fail if the old centering is put back.
+- Optional lr schedule (`--lr-points STEP:LR,...`). Resume now rebuilds the saved architecture.
 
 **B. 1-die tuning sweep (one overnight, ~8h):** use 1 die because it's cheap and has exact
 NashConv. Many parallel ~100k-step runs (~1h each at batch 512), 2 seeds each, rather than one
@@ -73,7 +76,7 @@ space and hidden information all differ).
 (train a fixed-budget exploiter against a frozen policy, both seats). Win rate vs bots is too
 weak to rank configurations.
 
-**D. 5-dice runs:** `--preset reference` with the best levers from B. Compare `InfoSetNet`
+**D. 5-dice runs:** the default settings with the best levers from B. Compare `InfoSetNet`
 (exact round encoding, 69 inputs) against the face net + `--face-rank --info-ctx 64` (weight
 sharing should pay off in sample efficiency at 5 dice, which the 1-die floor test can't show).
 Multi-night, plugged in, lid open. Baselines: the current NFSP bot, and optionally regularized
@@ -114,16 +117,16 @@ PPO.
 - `rnad_net.py` also has `InfoSetNet`: the reference implementation's architecture
   (MLP 256x256 on an exact per-round information-set encoding, `vec_env.info_features`,
   stored after the first 76 feature columns).
-- `train_rnad.py --preset reference` switches on DeepMind's reference settings, including
-  the NeuRD centering fix (see "Reference comparison"); defaults are unchanged so old
-  checkpoints resume exactly as before.
+- `train_rnad.py` defaults match DeepMind's reference implementation, including the NeuRD
+  centering fix (see "Reference comparison"); `test_matches_reference_losses` checks this.
 - `reference_check/` — DeepMind's reference R-NaD, our 1-die rules as an OpenSpiel game,
   and the side-by-side loss check (needs a separate JAX venv; see its README).
 - `RNaDNet --face-rank --info-ctx N` — face-shared net with face-rank inputs and an MLP over
   the exact round encoding (see "Network floor").
-- `test_vec_env.py`, `test_rnad.py` — 16 tests total, all passing: differential tests
+- `test_vec_env.py`, `test_rnad.py` — 20 tests total, all passing: differential tests
   of the vectorized engine/features against the original Python engine, brute-force
-  checks of the v-trace math (sampled and expected penalty), a Monte-Carlo cross-check
+  checks of the v-trace math (sampled and expected penalty), a golden check against DeepMind's
+  reference losses, a Monte-Carlo cross-check
   of the exact solver, the exact tools vs the slow solver, the reference
   EntropySchedule test cases, reference-mode training + checkpointing, and an
   `NFSPReg` fidelity check.
@@ -486,8 +489,7 @@ differ in the beta threshold check. All-action centering also limits the overall
 legal logits; legal-mean centering lets all logits drift together, which in a shared network
 can leak into other states.
 
-`--preset reference` now sets `center=all`, `value_coef=2`, `adam_eps=1e-7`, `init=haiku`,
-`init_reg=net`. Config defaults keep the old behaviour so old checkpoints resume unchanged.
+All of these are now the defaults (the legal-mean centering option is removed).
 
 **Even the reference doesn't reach Nash here:** it flattens around 0.22-0.26 raw (0.13 with
 fine-tuning) after 100-250k steps, versus CFR+ 0.0026 and the exact oracle 0.0074. That

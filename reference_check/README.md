@@ -5,8 +5,9 @@ rename for current JAX. `our_liars_dice.py` registers our 1-die rules (1s wild, 
 OpenSpiel game, so the reference can run on exactly our game. See `RNAD_FINDINGS.md`, "Reference
 comparison", for what these found.
 
-## Setup (separate venv; the project itself does not need JAX)
+## Setup (separate venv inside this folder - gitignored; the project itself does not need JAX)
 
+    cd reference_check
     python3.12 -m venv osenv
     ./osenv/bin/python -m pip install open_spiel jax jaxlib dm-haiku optax chex
 
@@ -28,7 +29,7 @@ our training helpers, in float64, and compares value targets, advantages and gra
     ./osenv/bin/python diff_theirs.py diff_batch.npz diff_theirs_out.npz   # reference (JAX)
     python3 diff_compare.py
 
-Expected with our default options: value targets and advantages agree to ~1e-15; the value gradient is
-half the reference's (our 0.5 factor; `--value-coef 2` matches); the logit gradient differs until NeuRD
-centering is over all actions (`--center all`). `os_bridge.py` maps policies between our `exact_d1` arrays
-and OpenSpiel tabular policies.
+Expected: everything agrees to ~1e-15. (Before the fix, the logit gradient differed because our NeuRD
+centering used the legal-action mean, and the value gradient was half the reference's.) To refresh the
+golden fixture used by `test_rnad.py`, run `python3 make_golden.py` after the three commands above.
+`os_bridge.py` maps policies between our `exact_d1` arrays and OpenSpiel tabular policies.

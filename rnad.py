@@ -12,7 +12,7 @@ After `iter_steps` steps the target network's policy becomes the new regularizat
 import copy
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import torch
 import torch.nn.functional as F
@@ -27,47 +27,70 @@ NEG = float("-inf")
 
 @dataclass
 class Config:
+    """Defaults match DeepMind's reference R-NaD (open_spiel rnad.py, DeepNash Table 2; batch 512 and
+    the MLP as in the reference's Leduc run), verified numerically against it (reference_check/,
+    test_matches_reference_losses)."""
     dice: int = 5
     window: int = 8
     gru_hidden: int = 64
     score_hidden: int = 64
-    games_per_step: int = 1024
-    iter_steps: int = 1000       # learner steps per R-NaD iteration (the paper's delta_m)
+    games_per_step: int = 512
+    iter_steps: int = 20000      # learner steps per R-NaD iteration (delta_m); sched_sizes overrides
     eta: float = 0.2             # regularization strength
-    lr: float = 3e-4
-    gamma: float = 0.01          # target-network averaging rate
+    lr: float = 5e-5
+    lr_points: tuple = ()        # optional schedule ((step, lr), ...), linear from (0, lr); empty = constant
+    gamma: float = 0.001         # target-network averaging rate
     beta: float = 2.0            # NeuRD logit threshold
     adv_clip: float = 1e4
-    grad_clip: float = 10.0
-    value_coef: float = 1.0
-    adv_mode: str = "vtrace"    # "vtrace": paper's importance-weighted Q; "critic": learned per-action Q head
+    grad_clip: float = 0.0       # global grad-norm clip before Adam (0 = off, as in the reference)
+    value_coef: float = 1.0      # value loss = value_coef * (v - target)^2
+    adv_mode: str = "vtrace"     # "vtrace": paper's importance-weighted Q; "critic": learned per-action Q head
     q_coef: float = 1.0
     rho_bar: float = 1.0
     c_bar: float = 1.0
     chunk: int = 8192
     shaping: float = 0.0         # potential-based reward shaping on dice counts (0 = off, paper-faithful)
-    # Options added to match DeepMind's reference implementation (open_spiel rnad.py). The defaults
-    # keep the original behaviour so older checkpoints resume unchanged; train_rnad --preset reference
-    # switches them on.
-    net: str = "face"            # "face": RNaDNet; "infoset": MLP on the exact information set (reference)
+    net: str = "infoset"         # "infoset": MLP on the exact information set (reference); "face": RNaDNet
     hidden: int = 256            # InfoSetNet torso width
-    center: str = "legal"        # NeuRD logit centering: mean over "legal" actions, or over "all" actions (reference)
-    adam_eps: float = 1e-8       # reference: 1e-7 (optax eps=10e-8)
-    init: str = "torch"          # "torch" default init, or "haiku": truncated normal std 1/sqrt(fan_in), zero bias
-    init_reg: str = "uniform"    # initial regularization policy: "uniform", or "net" = the initial network (reference)
+    adam_eps: float = 1e-7       # optax eps=10e-8 in the reference
+    init: str = "haiku"          # Haiku's default Linear init (reference) or "torch"
+    init_reg: str = "net"        # initial regularization policy: the initial network (reference) or "uniform"
     face_rank: bool = False      # RNaDNet: face-rank inputs to the shared per-face MLP
     info_ctx: int = 0            # RNaDNet: width of the exact-round-encoding context MLP (0 = off)
-    reg_reward: str = "sampled"  # penalty in the reward stream: "sampled" log-ratio of the taken action (paper's
-                                 # equations) or "expected" KL(pi || pi_reg) at each step (reference code)
-    loss_norm: str = "global"    # "global": mean over all rows; "per_player": mean per player, summed (reference);
-                                 # "infoset": policy loss averaged per distinct information set in the batch, so
-                                 # every visited infoset takes the same-size step (value loss stays per player)
+    reg_reward: str = "expected" # penalty in the reward stream: expected KL(pi || pi_reg) at each step (reference
+                                 # code) or "sampled" log-ratio of the taken action (the paper's equations)
+    loss_norm: str = "per_player"  # "per_player": mean per player, summed (reference); "global": mean over all
+                                 # rows; "infoset": policy loss averaged per distinct information set in the batch
     sched_sizes: tuple = ()      # delta_m schedule as in the reference's EntropySchedule; empty -> (iter_steps,)
     sched_repeats: tuple = ()
 
     @property
     def spec(self) -> Spec:
         return Spec(dice=self.dice, window=self.window)
+
+
+# Checkpoints saved before an option existed: fields to assume when the saved config lacks them.
+_LEGACY_FIELDS = {"net": "face"}           # before InfoSetNet, every checkpoint used the face-shared net
+
+
+def config_from_dict(d: dict) -> Config:
+    """Config from a saved checkpoint. Drops options that no longer exist (e.g. `center`, the legal-action
+    NeuRD centering that caused the pre-a614b1a degradation) and fills architecture fields older checkpoints
+    predate, so they still load; training resumes with the current, corrected code."""
+    known = {f.name for f in fields(Config)}
+    d = {k: v for k, v in d.items() if k in known}
+    for k, v in _LEGACY_FIELDS.items():
+        d.setdefault(k, v)
+    return Config(**d)
+
+
+def lr_at(cfg: Config, step: int) -> float:
+    """Learning rate at `step`: piecewise-linear through (0, cfg.lr) and cfg.lr_points, constant after."""
+    pts = [(0, cfg.lr)] + sorted((int(a), float(b)) for a, b in cfg.lr_points)
+    for (s0, l0), (s1, l1) in zip(pts, pts[1:]):
+        if step < s1:
+            return l0 + (l1 - l0) * (step - s0) / max(1, s1 - s0)
+    return pts[-1][1]
 
 
 class EntropySchedule:
@@ -239,12 +262,13 @@ def vtrace_advantage(pi, pen, act, logmu, gm):
     return q_hat - (pi * q_hat).sum(-1, keepdim=True)
 
 
-def neurd_loss(logits, mask, adv, beta, center="legal"):
+def neurd_loss(logits, mask, adv, beta):
     """Per-row NeuRD loss: push centered logits along the advantage, but only while they stay within
-    [-beta, beta] of the center (the reference's apply_force_with_threshold). center="legal" uses the mean
-    of the legal logits; "all" divides their sum by the number of actions, as the reference does."""
-    n = mask.sum(-1, keepdim=True).float() if center == "legal" else float(mask.shape[-1])
-    lc = logits - (logits * mask).sum(-1, keepdim=True) / n
+    [-beta, beta] (the reference's apply_force_with_threshold). Logits are centered on the SUM of the legal
+    logits divided by the number of ALL actions, exactly as the reference does. Centering on the legal-action
+    mean instead was the bug behind every degrading run before commit a614b1a: it leaves the overall level
+    of the logits unconstrained, and training degrades after a few reference resets."""
+    lc = logits - (logits * mask).sum(-1, keepdim=True) / mask.shape[-1]
     force = torch.where(adv > 0, lc < beta, lc > -beta)
     return -(mask * force * lc * adv).sum(-1)
 
@@ -264,6 +288,8 @@ class RNaD:
         self.net = build_net(cfg)
         if cfg.init == "haiku":
             haiku_init_(self.net)
+            if getattr(self.net, "face_rank", False):        # keep the face net's face-invariant start
+                self.net.face_invariant_start(haiku=True)
         self.target = copy.deepcopy(self.net)
         for p in self.target.parameters():
             p.requires_grad_(False)
@@ -360,8 +386,8 @@ class RNaD:
                     adv = vtrace_advantage(pi, pen, traj.act[sl], traj.logmu[sl], gm[sl])
                 adv = adv.clamp(-cfg.adv_clip, cfg.adv_clip)
             nl = mask.sum(-1, keepdim=True).float()
-            pol_loss = neurd_loss(logits, mask, adv, cfg.beta, cfg.center)
-            val_loss = 0.5 * (value - vh[sl]) ** 2
+            pol_loss = neurd_loss(logits, mask, adv, cfg.beta)
+            val_loss = (value - vh[sl]) ** 2
             q_loss = 0.5 * (qv.gather(1, traj.act[sl][:, None]).squeeze(1) - (gm[sl] + v[sl])) ** 2 \
                 if cfg.adv_mode == "critic" else torch.zeros_like(val_loss)
             (wpol[sl] * pol_loss + wrow[sl] * (cfg.value_coef * val_loss + cfg.q_coef * q_loss)).sum().backward()
@@ -375,6 +401,9 @@ class RNaD:
             gn = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
         else:
             gn = torch.norm(torch.stack([p.grad.norm() for p in self.net.parameters() if p.grad is not None]))
+        lr = lr_at(cfg, self.step_count)
+        for g in self.opt.param_groups:
+            g["lr"] = lr
         self.opt.step()
         with torch.no_grad():
             for pt, pn in zip(self.target.parameters(), self.net.parameters()):
@@ -386,7 +415,7 @@ class RNaD:
         self.iter, start, _ = self.schedule.iteration(self.step_count)
         self.n_in_iter = self.step_count - start
         return dict(rows=S, games=traj.n_envs, len=S / traj.n_envs, kl=acc["kl"] / S, ent=acc["ent"] / S,
-                    val=acc["val"] / S, pol=acc["pol"] / S, gn=float(gn), t_roll=t1 - t0, t_learn=time.time() - t1,
+                    val=acc["val"] / S, pol=acc["pol"] / S, gn=float(gn), lr=lr, t_roll=t1 - t0, t_learn=time.time() - t1,
                     seat0=float((traj.winner == 0).float().mean()))
 
     def state_dict(self):
@@ -448,7 +477,7 @@ class RNaDBot(Bot):
 def load_policy_net(path, which="target"):
     """Load the deployable network from a checkpoint saved by train_rnad.py."""
     sd = torch.load(path, map_location="cpu")
-    cfg = Config(**sd["cfg"])
+    cfg = config_from_dict(sd["cfg"])
     net = build_net(cfg)
     net.load_state_dict(sd[which])
     net.eval()

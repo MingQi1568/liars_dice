@@ -5,6 +5,8 @@ face 2-6 with shared weights; separate face-1 and liar heads), but it outputs po
 and a scalar VALUE, and reads the bid history as a fixed window of the last K bids run
 through a masked GRU cell, so a whole batch is processed with plain tensor ops.
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,12 +38,7 @@ class RNaDNet(nn.Module):
         if face_rank:
             rank = torch.cat([torch.arange(5, dtype=torch.float32)[:, None] / 4.0, torch.eye(5)], dim=1)   # (5, 6)
             self.register_buffer("rank_feats", rank)
-            with torch.no_grad():               # start exactly face-invariant; asymmetry grows only where gradients
-                plain = nn.Linear(10, FACE_EMB)  # push it: rank inputs contribute 0 at init, and the other inputs
-                first = self.shared_face_mlp[0]  # are initialized at the plain 10-input layer's scale
-                first.weight.zero_()
-                first.weight[:, :10].copy_(plain.weight)
-                first.bias.copy_(plain.bias)
+            self.face_invariant_start()
         if info_ctx:
             self.info_mlp = nn.Sequential(nn.Linear(spec.info_dim, 2 * info_ctx), nn.ReLU(),
                                           nn.Linear(2 * info_ctx, info_ctx), nn.ReLU())
@@ -52,6 +49,21 @@ class RNaDNet(nn.Module):
         self.liar_head = nn.Sequential(nn.Linear(G + 8 + FACE_EMB + 2, LIAR_HIDDEN), nn.ReLU(), nn.Linear(LIAR_HIDDEN, 2))
         self.value_head = nn.Sequential(
             nn.Linear(G + FACE_EMB + FACE_EMB + 8 + FACE_EMB, VALUE_HIDDEN), nn.ReLU(), nn.Linear(VALUE_HIDDEN, 1))
+
+    def face_invariant_start(self, haiku: bool = False):
+        """Zero the rank inputs' weights, so the net starts exactly face-invariant and asymmetry grows only
+        where gradients push it, and initialize the layer's other inputs like a plain 10-input layer
+        (PyTorch's default init, or Haiku's when haiku=True). Call again after re-initializing weights."""
+        first = self.shared_face_mlp[0]
+        plain = nn.Linear(10, FACE_EMB)
+        with torch.no_grad():
+            if haiku:
+                std = 1.0 / math.sqrt(10)
+                nn.init.trunc_normal_(plain.weight, std=std, a=-2 * std, b=2 * std)
+                nn.init.zeros_(plain.bias)
+            first.weight.zero_()
+            first.weight[:, :10].copy_(plain.weight)
+            first.bias.copy_(plain.bias)
 
     def parts(self, static, win, wmask):
         B = static.shape[0]

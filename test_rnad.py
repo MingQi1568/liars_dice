@@ -226,6 +226,71 @@ def test_infoset_loss_weights():
     assert int(cnt.max()) > 1 and cnt.shape[0] < traj.S          # infosets genuinely repeat within a batch
 
 
+def test_matches_reference_losses():
+    """Golden test against DeepMind's reference implementation (open_spiel rnad.py): on a fixed batch from
+    our engine, our v-trace targets, advantages and the gradients of our policy and value losses must equal
+    the reference's outputs (computed by reference_check/, stored in test_data/). Guards against the
+    NeuRD-centering kind of bug coming back."""
+    import os
+    import numpy as np
+    from rnad import Traj, neurd_loss, vtrace_advantage
+    f = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", "reference_losses_d1.npz"))
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        t = {k: torch.tensor(f[k]) for k in f.files}
+        cols = {k: t[k] for k in ("env", "player", "act", "logmu", "final", "shape")}
+        traj = Traj(cols, [int(x) for x in f["offsets"]], t["winner"], int(t["winner"].shape[0]))
+        mask = t["mask"].bool()
+        eta, beta = 0.2, 2.0
+        logits = t["logits"].clone().requires_grad_(True)
+        v_on = t["v_online"].clone().requires_grad_(True)
+        logp = torch.log_softmax(logits.masked_fill(~mask, float("-inf")), -1)
+        pi, logpi = logp.exp().detach(), logp.masked_fill(~mask, 0.0).detach()
+        pen_row = eta * (pi * (logpi - t["logreg"])).sum(-1)
+        vh, gm = two_player_vtrace(traj, t["v"], t["logmu"], t["logreg"].gather(1, traj.act[:, None]).squeeze(1),
+                                   eta, None, 1.0, 1.0, pen_row)
+        adv = vtrace_advantage(pi, eta * (logpi - t["logreg"]), traj.act, t["logmu"], gm).clamp(-1e4, 1e4)
+        w = 1.0 / torch.bincount(traj.player, minlength=2).double()[traj.player]
+        (w * neurd_loss(logits, mask, adv, beta)).sum().backward()
+        (w * (v_on - vh) ** 2).sum().backward()
+        assert (vh - t["ref_vh"]).abs().max() < 1e-10
+        assert ((adv - t["ref_adv"]).abs() * mask).max() < 1e-9
+        assert (logits.grad - t["ref_grad_logit"]).abs().max() < 1e-12
+        assert (v_on.grad - t["ref_grad_v"]).abs().max() < 1e-12
+    finally:
+        torch.set_default_dtype(old)
+
+
+def test_lr_schedule():
+    from rnad import lr_at
+    cfg = Config(lr=5e-5, lr_points=((100, 5e-5), (200, 5e-6)))
+    assert lr_at(cfg, 0) == 5e-5 and lr_at(cfg, 99) == 5e-5
+    assert abs(lr_at(cfg, 150) - 2.75e-5) < 1e-12 and lr_at(cfg, 200) == 5e-6 and lr_at(cfg, 10 ** 6) == 5e-6
+    assert lr_at(Config(lr=3e-4), 12345) == 3e-4
+
+
+def test_old_checkpoint_configs_load():
+    """Checkpoints from before the centering fix carry a removed `center` option, and the oldest ones
+    predate the `net` option (they used the face net); both must still load."""
+    from rnad import config_from_dict
+    from dataclasses import asdict
+    d = asdict(Config(dice=1))
+    d.pop("net")
+    d["center"] = "legal"
+    cfg = config_from_dict(d)
+    assert cfg.net == "face" and not hasattr(cfg, "center")
+
+
+def test_face_rank_starts_face_invariant():
+    """With face-rank inputs, the face net must start exactly face-invariant under both inits (Haiku-style
+    init used to overwrite the zeroed rank weights)."""
+    for init in ("torch", "haiku"):
+        agent = RNaD(Config(dice=2, net="face", face_rank=True, info_ctx=16, init=init, games_per_step=8))
+        w = agent.net.shared_face_mlp[0].weight
+        assert (w[:, 10:] == 0).all(), init
+
+
 def _dummy_state():
     from game import Bid, GameState
     return GameState([3], 0, 2, [1, 1], 2, Bid(1, 4), [(1, Bid(1, 4))], 1)

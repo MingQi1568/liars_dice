@@ -48,7 +48,7 @@ adv = vtrace_advantage(pi, ETA * (logpi - logreg), traj.act, logmu, gm).clamp(-C
 n_p = torch.bincount(traj.player, minlength=2).double()
 w = 1.0 / n_p[traj.player]
 (w * neurd_loss(logits, mask, adv, BETA)).sum().backward()
-(w * 0.5 * (v_on - vh) ** 2).sum().backward()
+(w * (v_on - vh) ** 2).sum().backward()
 
 # ---- export in the reference's time-major layout
 order = torch.argsort(traj.env, stable=True)
@@ -73,7 +73,11 @@ for b, rows in enumerate(rows_of):
         out["row"][t, b] = r
     out["rewards"][len(rows) - 1, b] = [1.0, -1.0] if win[b] == 0 else [-1.0, 1.0]
 ours = dict(vh=vh.numpy(), adv=adv.numpy(), grad_logit=logits.grad.numpy(), grad_v=v_on.grad.numpy(),
-            mask=mask.numpy(), logits=logits.detach().numpy(), player=traj.player.numpy(), w=w.numpy())
+            mask=mask.numpy(), logits=logits.detach().numpy(), player=traj.player.numpy(), w=w.numpy(),
+            # the flat batch, so make_golden.py can store a fixture the regular test suite rebuilds without JAX
+            env=traj.env.numpy(), act=traj.act.numpy(), logmu=logmu.numpy(), final=traj.final.numpy(),
+            shape=traj.shape.double().numpy(), offsets=np.array(traj.offsets), winner=traj.winner.numpy(),
+            v=v.numpy(), logreg=logreg.numpy(), v_online=v_on.detach().numpy())
 np.savez(sys.argv[1], **out)
 np.savez(sys.argv[2], **ours)
 print(f"exported T={T} B={B}; {int((adv.abs() > 0).sum())} nonzero advantages; "
