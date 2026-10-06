@@ -18,6 +18,67 @@ included in this repo).
 > that blame noise, compute scale or reset timing for it are superseded. Use
 > `train_rnad.py --preset reference`, which now matches the reference implementation.
 
+## Summary of findings (as of 2026-10-06)
+
+The detailed sections further down are the record; this is what holds up.
+
+1. **The tools are trustworthy.** The vectorized engine matches the original Python engine
+   (differential tests) and is ~60x faster. The 1-die exact solver (`exact_d1.py`) agrees
+   with OpenSpiel's independent tools to 6 decimals on our rules. CFR+ solves 1 die to
+   NashConv 0.0026; uniform-random play is 1.563.
+2. **Our R-NaD had one real bug: NeuRD logit centering.** Matched against DeepMind's code
+   on an identical batch, value targets and advantages agree to ~1e-15; the only material
+   difference was centering (legal-action mean vs sum over legal / all actions). Reverting
+   only that reproduces the old "improves, then degrades after a few reference resets"
+   failure; with it fixed, our code tracks DeepMind's own code on our game. All runs before
+   commit a614b1a (every 5-dice run, the 20-hour run) are invalid for judging R-NaD.
+3. **What sampled R-NaD can realistically reach at 1 die:** ~0.23 raw / ~0.13 with DeepNash
+   fine-tuning after 100-250k steps (DeepMind's code on our game). The noise-free tabular
+   version reaches 0.0074, so the remaining gap is sampling noise and function approximation,
+   not the algorithm. DeepMind's own Leduc result plateaus similarly (~0.18).
+4. **Network floors** (exact CFR+ policy distilled into each net): `InfoSetNet` 0.043; the
+   face-shared net 0.28, cut to ~0.11 by adding face-rank inputs and a round-context MLP. The
+   leftover error is in choosing among raises, not the liar call.
+5. **Where errors live:** on the frequently visited main line, not rare infosets. Fine-tuning
+   (drop probabilities < 0.03, round to 1/32) gives a large, free improvement near the plateau.
+6. **Things that are not good signals:** win rate vs SmartBot/BestBot (not exploitability;
+   distorted by non-transitivity); successor-vs-predecessor ~50% (expected either way; only a
+   crash guardrail).
+7. **Batch size and learning rate** have not been tested with the fixed code. DeepMind uses
+   a constant lr (5e-5) and a huge batch, and smooths through the slow target network
+   (EMA 0.001) rather than an lr schedule.
+
+## Path forward
+
+**A. Fixes before any new training (short):**
+- **Flip the `Config` defaults to the reference-correct values** (`center="all"`,
+  `value_coef=2`, `init="haiku"`, `init_reg="net"`, `adam_eps=1e-7`, expected-KL, per-player
+  loss) and backfill the old values only when loading checkpoints saved without them. Today the
+  defaults still carry the centering bug, which is an easy mistake to make again.
+- **Fix init order:** `init="haiku"` re-randomizes the face net's zero-initialized rank weights
+  (verified), so the face net no longer starts face-invariant under the preset.
+- **Add a golden regression test:** save the side-by-side batch and DeepMind's outputs as a small
+  fixture so the normal test suite checks our losses against the reference without needing JAX.
+- **Push the branch** so the other machine has the fix.
+
+**B. 1-die tuning sweep (one overnight, ~8h):** use 1 die because it's cheap and has exact
+NashConv. Many parallel ~100k-step runs (~1h each at batch 512), 2 seeds each, rather than one
+long run. Levers, in priority order: batch size (512 vs 4096), late lr decay vs constant, Δm
+(10k vs 50k), target-network EMA, eta (0.2 vs 0.5). Compare raw and fine-tuned NashConv at
+equal outer iterations. Treat results as which levers matter and which settings are stable, not
+as final 5-dice numbers: hyperparameters don't transfer numerically (episode length, action
+space and hidden information all differ).
+
+**C. 5-dice evaluation before 5-dice training:** build an approximate best-response probe
+(train a fixed-budget exploiter against a frozen policy, both seats). Win rate vs bots is too
+weak to rank configurations.
+
+**D. 5-dice runs:** `--preset reference` with the best levers from B. Compare `InfoSetNet`
+(exact round encoding, 69 inputs) against the face net + `--face-rank --info-ctx 64` (weight
+sharing should pay off in sample efficiency at 5 dice, which the 1-die floor test can't show).
+Multi-night, plugged in, lid open. Baselines: the current NFSP bot, and optionally regularized
+PPO.
+
 ## Files added on this branch
 
 - `vec_env.py` — vectorized engine: N games advance in lockstep as tensor ops
@@ -454,13 +515,7 @@ remaining gap is in choosing among raises. Single seed; ~±0.02 noise between ch
 
 ## Suggested next steps
 
-1. **Re-run 5 dice with the fixed settings** (`--preset reference`, i.e. all-action
-   centering). Every 5-dice conclusion in this doc predates the fix.
-2. **For 5 dice, compare `InfoSetNet` with the face-shared net + `--face-rank --info-ctx 64`**:
-   the face net's weight sharing is a sample-efficiency bet that only pays off at 5 dice.
-3. If R-NaD still plateaus too high: a smoothed reference (GARIP / EMAgnet), or regularized
-   PPO (see the ICLR 2026 note in the PPO section).
-4. Lower priority: an approximate best-response probe for 5-dice comparisons.
+See "Path forward" at the top.
 
 ## Checkpoints produced this session (gitignored, not in this PR)
 
