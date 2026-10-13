@@ -45,9 +45,12 @@ The detailed sections further down are the record; this is what holds up.
 6. **Things that are not good signals:** win rate vs SmartBot/BestBot (not exploitability;
    distorted by non-transitivity); successor-vs-predecessor ~50% (expected either way; only a
    crash guardrail).
-7. **Batch size and learning rate** have not been tested with the fixed code. DeepMind uses
-   a constant lr (5e-5) and a huge batch, and smooths through the slow target network
-   (EMA 0.001) rather than an lr schedule.
+7. **Hyperparameters don't break the 1-die plateau** (overnight sweep, 7 arms x 2 seeds, see
+   "1-die tuning sweep" below). Every arm settles at 0.22-0.25 raw / 0.11-0.15 fine-tuned,
+   i.e. DeepMind's own number, after ~100-200M games; more training buys almost nothing. Δm 50k
+   was best (0.223 / 0.113) and a late lr decay was the most stable; eta 0.5 and target EMA 0.01
+   didn't help. A follow-up long run settled batch size: at Δm 10k batch 4096 stays at ~0.245
+   for 31 iterations, but batch 4096 + Δm 50k is the best result so far, 0.215 [0.11], at ~4x the games.
 
 ## Path forward
 
@@ -64,7 +67,7 @@ The detailed sections further down are the record; this is what holds up.
   fail if the old centering is put back.
 - Optional lr schedule (`--lr-points STEP:LR,...`). Resume now rebuilds the saved architecture.
 
-**B. 1-die tuning sweep (one overnight, ~8h):** use 1 die because it's cheap and has exact
+**B. 1-die tuning sweep (one overnight, ~8h) — done 2026-10-06, results below.** Plan was: use 1 die because it's cheap and has exact
 NashConv. Many parallel ~100k-step runs (~1h each at batch 512), 2 seeds each, rather than one
 long run. Levers, in priority order: batch size (512 vs 4096), late lr decay vs constant, Δm
 (10k vs 50k), target-network EMA, eta (0.2 vs 0.5). Compare raw and fine-tuned NashConv at
@@ -494,6 +497,143 @@ All of these are now the defaults (the legal-mean centering option is removed).
 **Even the reference doesn't reach Nash here:** it flattens around 0.22-0.26 raw (0.13 with
 fine-tuning) after 100-250k steps, versus CFR+ 0.0026 and the exact oracle 0.0074. That
 matches DeepMind's own Leduc plateau (~0.18) and is the realistic target for sampled R-NaD.
+
+## 1-die tuning sweep (2026-10-06, after the centering fix)
+
+`sweeps/sweep_d1.sh`: 7 arms x 2 seeds, all 14 in parallel on 10 cores for ~7.5h, default
+(reference) settings plus Δm 10k unless stated. Exact NashConv every 10k steps (5k at batch
+4096), raw [fine-tuned: threshold 0.03, discretize 1/32]. Each cell is the mean over the two seeds
+of all evals in the last 20% of steps before that many games (single evals are noisy, ±0.02 for
+`base`), so arms are compared at equal samples. `sweeps/summarize_sweep.py` gives the per-step view.
+
+| Arm | 50M games | 100M | 200M | 300M | Final 20% (games) | Final eval spread, last 200k steps |
+|---|---|---|---|---|---|---|
+| base (batch 512, lr 5e-5) | 0.286 [0.182] | 0.253 [0.154] | 0.234 [0.134] | 0.231 [0.133] | 0.248 [0.148] (348M) | std 0.016 / 0.008 |
+| **dm50k** (Δm 50k) | 0.334 [0.221] | **0.242 [0.132]** | 0.232 [0.133] | **0.227 [0.117]** | **0.223 [0.113]** (353M) | std 0.003 / 0.002 |
+| lrdecay (to 5e-6 over 300-600k) | 0.286 [0.182] | 0.253 [0.154] | 0.233 [0.133] | 0.227 [0.130] | 0.227 [0.131] (307M) | std 0.002 / 0.001 |
+| gamma01 (target EMA 0.01) | 0.287 [0.190] | 0.253 [0.152] | 0.235 [0.128] | 0.233 [0.138] | 0.246 [0.150] (348M) | — |
+| eta05 (eta 0.5) | 0.286 [0.182] | 0.244 [0.144] | 0.240 [0.134] | 0.236 [0.138] | 0.244 [0.146] (353M) | — |
+| b4096 (batch 4096) | 0.538 [0.441] | 0.420 [0.325] | 0.331 [0.227] | 0.294 [0.195] | 0.244 [0.150] (532M) | — |
+| b4096 + lr decay (50-100k) | 0.538 [0.441] | 0.420 [0.325] | 0.331 [0.227] | 0.297 [0.200] | 0.262 [0.161] (410M) | — |
+
+Reference points: DeepMind's code on our game ~0.23 [0.13]; visit-weighted exact oracle 0.246;
+InfoSetNet distillation floor 0.043; unweighted exact oracle 0.0074; CFR+ 0.0026.
+
+- **Every arm hits the same plateau, ~0.22-0.25 raw.** Most of the progress is done by
+  100-200M games (~200-400k steps at batch 512); the next 150M games move it by <0.01.
+  No run degraded (the centering fix holds over 60+ reference resets).
+- **The plateau is not network capacity** (InfoSetNet can represent 0.043, see "Network
+  floor"). It sits near the visit-weighted exact oracle's 0.246, which suggests the on-policy
+  visit weighting is a large part of it, but that is a correlation, not proof; batch 4096's
+  better per-iteration curve says gradient noise matters too.
+- **Δm 50k is the best arm**: slower start (fewer resets early), then the lowest and
+  steadiest result, best fine-tuned (0.113). Longer inner loops let each fixed point settle.
+- **Late lr decay doesn't lower the plateau but removes the jitter** (eval std 0.016 -> 0.001),
+  so the final checkpoint is reliable. The constant-lr `base` drifted from 0.231 to 0.248 at the end.
+- **Batch 4096: worse per game early, better per outer iteration, unresolved.** Per game it
+  starts far behind (0.42 vs 0.25 at 100M) and is 5x slower per step. But at equal outer
+  iterations (same steps, Δm 10k) it is ahead at every point: iter 5 0.314 vs 0.374, iter 9
+  0.246 vs 0.270, iter 12 0.244 [0.144] vs 0.265 [0.177]. Its raw NashConv has been flat at
+  ~0.244 since iteration 9 while fine-tuned was still falling, and it only got 13 iterations
+  (base got 68). Less gradient noise per iteration may lower the plateau; a longer batch-4096
+  run (30+ iterations, ideally also with Δm 50k) is needed to tell.
+- **eta 0.5 and target EMA 0.01 are neutral** within seed noise.
+- Sanity check: arms sharing a seed and config are bit-identical until they diverge
+  (base = lrdecay through 300k; b4096 = b4096_lrdecay through 50k).
+
+### Follow-up: long batch-4096 runs (2026-10-07, `sweeps/b4096_long.sh`)
+
+Batch 4096, constant lr 5e-5, 2 seeds each for Δm 10k and Δm 50k, 7.8h (~315k steps, 4 runs on the 4
+performance cores, ~0.084 s/step). Window means over both seeds, raw [fine-tuned]:
+
+| Outer iteration | Δm 10k, b512 | Δm 10k, b4096 | | Outer iteration | Δm 50k, b512 | Δm 50k, b4096 |
+|---|---|---|---|---|---|---|
+| 5 | 0.392 [0.295] | 0.320 [0.227] | | 2 | 0.358 [0.249] | 0.311 [0.205] |
+| 10 | 0.262 [0.169] | 0.245 [0.155] | | 3 | 0.271 [0.157] | 0.245 [0.136] |
+| 20 | 0.251 [0.159] | 0.246 [0.140] | | 4 | 0.241 [0.132] | 0.225 [0.124] |
+| 31 | 0.247 [0.144] | 0.242 [0.157] | | 6 | 0.229 [0.131] | **0.216 [0.112]** |
+
+- **Δm 10k + batch 4096 is flat** at 0.24-0.25 from iteration 10 to 31; 20 more reference
+  resets bought nothing, and batch 512 catches up to within seed noise. With short inner loops,
+  a bigger batch doesn't lower the plateau.
+- **Δm 50k + batch 4096 is the best result so far:** last 50k steps 0.215 [0.106] and 0.216
+  [0.111] for the two seeds (best single eval 0.212 [0.099]), ahead of batch 512 at every
+  outer iteration, and still slowly falling at the end (-0.004 raw, -0.017 fine-tuned per
+  100k steps). It is slightly below DeepMind's code on our game (~0.23 [0.13]).
+- **It costs about 4x the samples:** per game, batch 512 Δm 50k is at 0.227 by 300M games;
+  batch 4096 Δm 50k needs ~800M for 0.224. Better per outer iteration, worse per game.
+- Reading: the gains come from solving each regularized game more accurately per iteration
+  (longer Δm and less gradient noise together), consistent with the exact oracle, where the
+  quality of each inner solve sets the level. The improvement is real but modest (~0.01 raw);
+  the gap to the 0.043 network floor remains.
+
+**Why raw NashConv stops at ~0.21 (best checkpoint, `b4096_long/dm50k_s1`):** most of it is
+probability left on bad actions. Self-play reaches spots where the policy puts 8.1% of its mass on
+actions CFR+ plays under 0.1% of the time (CFR+: 0.02%), and the smallest legal-action probability
+averages 0.071. Centered logits are bunched just past the NeuRD threshold on the negative side
+(1st percentile -2.95, beta 2), while the top action reaches +8 to +12: once an action's centered
+logit is below -beta, the NeuRD gradient stops pushing it down. Removing that mass: threshold
+0.03 alone -> **0.091**, threshold + discretize -> 0.100, sharpening logits x1.25 -> 0.135 (x3 -> 0.277,
+since the equilibrium needs mixing). So after post-processing the gap to the 0.043 network floor
+is ~0.05. Next lever to test: a larger or annealed beta.
+
+**Training-time fine-tuning (added 2026-10-08).** DeepNash fine-tunes during training, not only at
+test time: after `FineTuning.from_learner_steps`, v-trace evaluates the thresholded + discretized policy
+(the reference's `merged_policy`), while actors still sample from the raw softmax and the NeuRD loss still
+uses the raw policy. Now `--finetune-from STEP` (with `--finetune-thr/--finetune-disc`). This makes the
+importance ratios differ from 1 for the first time, which exposed an off-policy difference in our v-trace
+(it weighted by the acting player's own ratio and used corrected rewards in the value target). The
+recursion is now a line-by-line port of the reference's; on-policy it reduces to the old one, so earlier
+runs are unaffected. Checked side by side with `reference_check/diff_ours.py ... ft` (agrees to ~1e-14)
+and pinned by `test_matches_reference_losses_with_finetuning`. `--resume` now accepts `--beta`,
+`--finetune-*` and `--lr` overrides. Experiment: `sweeps/ft_beta.sh`.
+
+**Result (`sweeps/ft_beta.sh`, plot `checkpoints/ft_beta/nashconv_ft_beta.png`): neither helps; keep beta 2 and
+fine-tune only at test time.** Window means, raw [fine-tuned]:
+
+| Run (changed at 150k) | 150-200k | 265-315k (control's last 50k) | last 50k (to ~450k) |
+|---|---|---|---|
+| control (no change), 2 seeds | 0.223-0.226 [0.121-0.127] | **0.215-0.216 [0.106-0.110]** | (ended at 315k) |
+| fine-tuning during training, 2 seeds | 0.228-0.236 [0.114-0.121] | 0.247-0.254 [0.124-0.131] | 0.257-0.262 [0.136-0.142] |
+| beta 4 | **0.106 [0.114]** | 0.118 [0.143] | 0.155 [0.174] |
+| beta 8 | 0.109 [0.123] | 0.125 [0.164] | 0.167 [0.192] |
+
+- **Fine-tuning during training made both numbers worse**, including the fine-tuned one it targets
+  (0.13 vs 0.11 at matched steps), and raw drifted up from 0.23 to 0.26.
+- **A larger beta does what we predicted at first, then degrades.** Raw NashConv halves within 5k
+  steps (best single eval 0.094, the best raw policy so far) because the tail can be pushed down, but
+  the fine-tuned number never improves, and from ~260k both rise steadily while entropy keeps falling
+  (1.04 -> 0.64) and the gradient norm stays 2-3x higher. The rises seem to come after reference resets,
+  consistent with each new reference being more deterministic than the last (a ratchet) - a hypothesis,
+  not checked. A sharper raw policy also loses the mixing that test-time fine-tuning needs.
+
+### 12-hour runs (2026-10-12, `sweeps/long12h.sh`, plots `checkpoints/long12h/*.png`)
+
+Seed 1 each. Window means, raw [fine-tuned].
+
+| Comparison | batch 4096, Δm 50k | batch 4096, Δm 10k | batch 16384, Δm 50k | batch 16384, Δm 10k |
+|---|---|---|---|---|
+| equal steps (95-120k) | 0.254 [0.169] | 0.243 [0.149] | 0.248 [0.160] | 0.244 [0.153] |
+| equal games (~1.0B) | 0.219 [0.127] | 0.240 [0.132] | 0.368 [0.268] | 0.290 [0.203] |
+| equal games (~1.9B) | 0.213 [0.102] | — | 0.251 [0.164] | 0.241 [0.152] |
+
+- **Batch 16384 gives nothing per step over 4096** (identical within noise at 95-120k), so it is 4x worse
+  per game. The per-iteration gain from 512 -> 4096 has saturated by 4096. (Δm 50k at 16384 only reached
+  its 2nd reset in 12h.)
+- **The control continued to 775k steps (15 resets):** raw 0.212 -> 0.206, fine-tuned flat at 0.10-0.11.
+  The plateau holds.
+- **Starting at the CFR+ equilibrium does not help:** from NashConv 0.038 (fine-tuned 0.054) it jumps to
+  0.39 within 5k steps, then settles at 0.23-0.26 raw [0.13-0.17], slightly worse than from scratch at the
+  same step (315-415k: 0.246 [0.135] vs 0.212 [0.102]). The plateau is where the sampled dynamics settle
+  wherever they start, not a level they are slowly descending from. Likely drivers (not yet isolated): 1/mu
+  importance weights on rarely sampled actions of a sharp policy, and the one-sided beta gate.
+
+**Settled so far** (1 die): long inner loops (Δm 50k) beat Δm 10k at both batch sizes, and are
+where a bigger batch pays off; batch 4096 + Δm 50k is the best configuration found (0.215 [0.11])
+at ~4x the games; late lr decay gives a stable final checkpoint; eta 0.2 and target EMA 0.001 are
+fine. Other routes below ~0.21: equalize the per-infoset step
+(the earlier `--loss-norm infoset` attempt was before the centering fix and should be re-tested), add
+exploration in the behaviour policy, or importance-correct visit frequency.
 
 ## Network floor and the liar decision (1 die, distilled from CFR+)
 
