@@ -1,17 +1,22 @@
 """Side-by-side check, part 1 (torch): build one batch with our engine, compute OUR value targets,
 advantages and loss gradients with the real training helpers, and export the batch in the reference's
-time-major [T, B] layout for diff_theirs.py."""
+time-major [T, B] layout for diff_theirs.py.
+
+    python3 diff_ours.py BATCH.npz OURS_OUT.npz [ft]
+With `ft`, v-trace evaluates DeepNash's fine-tuned (thresholded + discretized) policy, as the reference does
+after FineTuning.from_learner_steps; the importance ratios are then not 1, so this also checks that path."""
 import os
 import sys
 import numpy as np
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 torch.set_default_dtype(torch.float64)
-from rnad import NEG, collect, neurd_loss, two_player_vtrace, vtrace_advantage
+from rnad import NEG, collect, neurd_loss, penalty_and_ratio, post_process_policy, two_player_vtrace, vtrace_advantage
 from rnad_net import InfoSetNet
 from vec_env import Spec, VecEnv
 
 ETA, BETA, CLIP, ALPHA, SCALE = 0.2, 2.0, 1e4, 0.4, 25.0
+FT = len(sys.argv) > 3 and sys.argv[3] == "ft"
 spec = Spec(dice=1)
 torch.manual_seed(11)
 
@@ -42,8 +47,12 @@ pi, logpi = logp.exp().detach(), logp.masked_fill(~mask, 0.0).detach()
 logmu = traj.logmu.double()
 print(f"rows {S}, max |behaviour logprob - pi logprob| = {(logmu - logpi.gather(1, traj.act[:, None]).squeeze(1)).abs().max():.2e}")
 
-pen_row = ETA * (pi * (logpi - logreg)).sum(-1)                  # expected-KL penalty (reference mode)
-vh, gm = two_player_vtrace(traj, v, logmu, logreg.gather(1, traj.act[:, None]).squeeze(1), ETA, None, 1.0, 1.0, pen_row)
+merged = post_process_policy(pi, mask, 0.03, 32) if FT else None  # the policy v-trace evaluates
+pen_row, ratio = penalty_and_ratio(pi, logpi, logreg, traj.act, logmu, ETA, merged)   # expected-KL penalty
+if FT:
+    print(f"fine-tuning: ratio != 1 on {int(((ratio - 1).abs() > 1e-9).sum())} of {S} rows, zero on {int((ratio == 0).sum())}")
+vh, gm = two_player_vtrace(traj, v, logmu, logreg.gather(1, traj.act[:, None]).squeeze(1), ETA, ratio,
+                           float("inf"), 1.0, pen_row)
 adv = vtrace_advantage(pi, ETA * (logpi - logreg), traj.act, logmu, gm).clamp(-CLIP, CLIP)
 n_p = torch.bincount(traj.player, minlength=2).double()
 w = 1.0 / n_p[traj.player]
@@ -77,8 +86,8 @@ ours = dict(vh=vh.numpy(), adv=adv.numpy(), grad_logit=logits.grad.numpy(), grad
             # the flat batch, so make_golden.py can store a fixture the regular test suite rebuilds without JAX
             env=traj.env.numpy(), act=traj.act.numpy(), logmu=logmu.numpy(), final=traj.final.numpy(),
             shape=traj.shape.double().numpy(), offsets=np.array(traj.offsets), winner=traj.winner.numpy(),
-            v=v.numpy(), logreg=logreg.numpy(), v_online=v_on.detach().numpy())
-np.savez(sys.argv[1], **out)
+            v=v.numpy(), logreg=logreg.numpy(), v_online=v_on.detach().numpy(), ft=np.array(FT))
+np.savez(sys.argv[1], **out, ft=np.array(FT))
 np.savez(sys.argv[2], **ours)
 print(f"exported T={T} B={B}; {int((adv.abs() > 0).sum())} nonzero advantages; "
       f"{int(((logits.detach() - (logits.detach() * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True)).abs() > BETA).sum())} centered logits beyond beta")

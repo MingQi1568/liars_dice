@@ -46,7 +46,8 @@ class Config:
     value_coef: float = 1.0      # value loss = value_coef * (v - target)^2
     adv_mode: str = "vtrace"     # "vtrace": paper's importance-weighted Q; "critic": learned per-action Q head
     q_coef: float = 1.0
-    rho_bar: float = 1.0
+    rho_bar: float = float("inf")  # v-trace rho clip; the reference passes rho=inf (only matters off-policy,
+                                 # i.e. with training-time fine-tuning; on-policy the ratio is 1)
     c_bar: float = 1.0
     chunk: int = 8192
     shaping: float = 0.0         # potential-based reward shaping on dice counts (0 = off, paper-faithful)
@@ -63,6 +64,10 @@ class Config:
                                  # rows; "infoset": policy loss averaged per distinct information set in the batch
     sched_sizes: tuple = ()      # delta_m schedule as in the reference's EntropySchedule; empty -> (iter_steps,)
     sched_repeats: tuple = ()
+    finetune_from: int = -1      # DeepNash training-time fine-tuning: after this learner step, v-trace evaluates
+                                 # the thresholded + discretized policy (reference FineTuning); -1 = never
+    finetune_thr: float = 0.03   # drop actions below this probability
+    finetune_disc: int = 32      # round probabilities to multiples of 1/finetune_disc
 
     @property
     def spec(self) -> Spec:
@@ -212,39 +217,44 @@ class NFSPReg:
         return torch.log_softmax(logits, -1).masked_fill(~mask, 0.0)
 
 
-def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_bar=1.0, c_bar=1.0, pen=None):
-    """The paper's two-player v-trace, computed backward over whole games without bootstrapping.
+def two_player_vtrace(traj, v, logpi_taken, logreg_taken, eta, ratio=None, rho_bar=float("inf"), c_bar=1.0, pen=None):
+    """The reference's two-player v-trace (open_spiel rnad.py v_trace), computed backward over whole games
+    without bootstrapping, for both players at once.
 
     `pen` is the regularization penalty paid by the acting player at each row (and received by the other
     player); by default eta * log(pi/pi_reg) of the sampled action, as in the paper's equations. The
     reference code passes eta * KL(pi || pi_reg) instead, its expectation over actions (lower variance).
+    `ratio` is merged(taken)/mu(taken) for the policy being evaluated (None = on-policy, all 1). Mirroring the
+    reference: the value target uses the uncorrected opponent rewards and min(rho, own ratio * opponents'
+    ratios); the Q estimate uses opponent rewards weighted by the opponents' ratios.
     Returns (vh_row, gm_row): the value target for each decision's acting player, and
     (return-to-go estimate - v) used to build the importance-weighted Q estimate.
     """
     S, n = traj.S, traj.n_envs
     if pen is None:
         pen = eta * (logpi_taken - logreg_taken)
-    r_env = traj.shape.clone()
+    r_env = traj.shape.clone()                              # reward to the acting player at each row
     fin = traj.final
     r_env[fin] += torch.where(traj.winner[traj.env[fin]] == traj.player[fin], 1.0, -1.0)
-    r_act, r_oth = r_env - pen, -r_env + pen
     ratio = torch.ones(S) if ratio is None else ratio
-    vh, Vn, rh, xi = torch.zeros(n, 2), torch.zeros(n, 2), torch.zeros(n, 2), torch.ones(n, 2)
+    # per (game, player) carries: corrected reward R, uncorrected reward RU, next value NV, next value target
+    # NVT, and the product IS of the opponent's ratios since the player's last decision
+    R, RU, NV, NVT, IS = torch.zeros(n, 2), torch.zeros(n, 2), torch.zeros(n, 2), torch.zeros(n, 2), torch.ones(n, 2)
     vh_row, gm_row = torch.zeros(S), torch.zeros(S)
     offs = traj.offsets
     for t in range(len(offs) - 2, -1, -1):
         sl = slice(offs[t], offs[t + 1])
-        e, psi = traj.env[sl], traj.player[sl]
-        oth, rt, vt = 1 - psi, ratio[sl], v[sl]
-        vh_n, Vn_n, rh_n, xi_n = vh[e, psi], Vn[e, psi], rh[e, psi], xi[e, psi]
-        w = rt * xi_n
-        rho, c = w.clamp(max=rho_bar), w.clamp(max=c_bar)
-        vh_new = vt + rho * (r_act[sl] + rt * rh_n + Vn_n - vt) + c * (vh_n - Vn_n)
-        gm_row[sl] = r_env[sl] + rt * (rh_n + vh_n) - vt
+        e, a = traj.env[sl], traj.player[sl]
+        o, cs, vt, rew, pn = 1 - a, ratio[sl], v[sl], r_env[sl], pen[sl]
+        R_a, RU_a, NV_a, NVT_a, IS_a = R[e, a], RU[e, a], NV[e, a], NVT[e, a], IS[e, a]
+        w = cs * IS_a
+        vh_new = vt + w.clamp(max=rho_bar) * (rew + RU_a - pn + NV_a - vt) + w.clamp(max=c_bar) * (NVT_a - NV_a)
+        gm_row[sl] = rew + R_a + IS_a * NVT_a - vt
         vh_row[sl] = vh_new
-        vh[e, psi], Vn[e, psi], rh[e, psi], xi[e, psi] = vh_new, vt, 0.0, 1.0
-        rh[e, oth] = r_oth[sl] + rt * rh[e, oth]
-        xi[e, oth] = rt * xi[e, oth]
+        R[e, a], RU[e, a], NV[e, a], NVT[e, a], IS[e, a] = 0.0, 0.0, vt, vh_new, 1.0
+        RU[e, o] = -rew + RU[e, o] + pn                     # the other player: reward -rew, penalty +pn
+        R[e, o] = pn + cs * (-rew + R[e, o])
+        IS[e, o] = cs * IS[e, o]
     return vh_row, gm_row
 
 
@@ -252,6 +262,38 @@ def build_net(cfg: Config):
     if cfg.net == "infoset":
         return InfoSetNet(cfg.spec, cfg.hidden)
     return RNaDNet(cfg.spec, cfg.gru_hidden, cfg.score_hidden, cfg.face_rank, cfg.info_ctx)
+
+
+def post_process_policy(p, mask, thr=0.03, disc=32):
+    """DeepNash's fine-tuning projection (reference FineTuning.post_process_policy): drop legal actions with
+    probability < thr (unless all are) and renormalize, then, from the largest probability down, round each up
+    to a multiple of 1/disc until the total reaches 1; leftover weight goes to the largest action."""
+    if thr > 0:
+        keep = mask & ((p >= thr) | (p.amax(-1, keepdim=True) < thr))
+        p = torch.where(keep, p, torch.zeros_like(p))
+        p = p / p.sum(-1, keepdim=True)
+    if disc > 0:
+        roundup = torch.ceil(p * disc)
+        order = torch.argsort(-p, dim=-1, stable=True)
+        out = torch.zeros_like(p)
+        left = torch.full(p.shape[:-1], float(disc), dtype=p.dtype)
+        for k in range(p.shape[-1]):
+            a = order[:, k: k + 1]
+            x = torch.minimum(roundup.gather(1, a).squeeze(1), left)
+            out.scatter_add_(1, a, x[:, None])
+            left = left - x
+        p = out.scatter_add_(1, order[:, :1], left[:, None]) / disc
+    return p
+
+
+def penalty_and_ratio(pi, logpi, logreg, act, logmu, eta, merged=None):
+    """The expected regularization penalty eta * sum_a merged(a) log(pi(a)/pi_reg(a)) for each row, and the
+    v-trace importance ratio merged(taken)/mu(taken). `merged` is the policy v-trace evaluates (the reference's
+    merged_policy): pi itself by default (on-policy, ratio None = 1), or its fine-tuning projection."""
+    if merged is None:
+        return eta * (pi * (logpi - logreg)).sum(-1), None
+    pen = eta * (merged * (logpi - logreg)).sum(-1)
+    return pen, merged.gather(1, act[:, None]).squeeze(1) / logmu.exp()
 
 
 def vtrace_advantage(pi, pen, act, logmu, gm):
@@ -348,11 +390,16 @@ class RNaD:
         if alpha < 1.0:
             logreg = alpha * logreg + (1.0 - alpha) * regf(self.reg_prev)
         logreg_taken = logreg.gather(1, traj.act[:, None]).squeeze(1)
-        pen = None
-        if cfg.reg_reward == "expected":                        # on-policy: the behaviour policy is pi itself
-            mu = traj.logmu_all.exp() * traj.mask
-            pen = cfg.eta * (mu * (traj.logmu_all - logreg)).sum(-1)
-        vh, gm = two_player_vtrace(traj, v, traj.logmu, logreg_taken, cfg.eta, None, cfg.rho_bar, cfg.c_bar, pen)
+        pen, ratio = None, None
+        mu = traj.logmu_all.exp() * traj.mask                  # on-policy: the behaviour policy is pi itself
+        merged = None
+        if cfg.finetune_from >= 0 and self.step_count > cfg.finetune_from:
+            merged = post_process_policy(mu, traj.mask, cfg.finetune_thr, cfg.finetune_disc)
+        if cfg.reg_reward == "expected":
+            pen, ratio = penalty_and_ratio(mu, traj.logmu_all, logreg, traj.act, traj.logmu, cfg.eta, merged)
+        elif merged is not None:
+            ratio = merged.gather(1, traj.act[:, None]).squeeze(1) / traj.logmu.exp()
+        vh, gm = two_player_vtrace(traj, v, traj.logmu, logreg_taken, cfg.eta, ratio, cfg.rho_bar, cfg.c_bar, pen)
         if cfg.loss_norm in ("per_player", "infoset"):          # mean over each player's steps, summed over players
             n_p = torch.bincount(traj.player, minlength=2).clamp(min=1).float()
             wrow = 1.0 / n_p[traj.player]

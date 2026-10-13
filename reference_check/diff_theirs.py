@@ -9,7 +9,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rnad_ref as rnad
 
-d = {k: jnp.asarray(v) for k, v in np.load(sys.argv[1]).items() if k != "row"}
+d = {k: jnp.asarray(v) for k, v in np.load(sys.argv[1]).items() if k not in ("row", "ft")}
+FT = bool(np.load(sys.argv[1])["ft"]) if "ft" in np.load(sys.argv[1]).files else False
+finetune = rnad.FineTuning(from_learner_steps=0, policy_threshold=0.03, policy_discretization=32)
 ETA, BETA, CLIP = 0.2, 2.0, 1e4
 
 
@@ -18,9 +20,11 @@ def loss(logit, v_online):
     pi = rnad._legal_policy(logit, legal)
     log_pi = rnad.legal_log_policy(logit, legal)
     log_policy_reg = log_pi - d["log_reg"]          # reference: log_pi - (alpha * log_pi_prev + (1 - alpha) * log_pi_prev_)
+    # reference RNaDSolver.loss: policy_pprocessed = self.config.finetune(pi, legal, learner_steps)
+    merged = finetune(pi, legal, 1) if FT else pi
     vts, hps, pts = [], [], []
     for player in range(2):
-        vt, hp, pt = rnad.v_trace(d["v_target"], d["valid"], d["player_id"], d["acting_policy"], pi, log_policy_reg,
+        vt, hp, pt = rnad.v_trace(d["v_target"], d["valid"], d["player_id"], d["acting_policy"], merged, log_policy_reg,
                                   rnad._player_others(d["player_id"], d["valid"], player), d["actions_oh"],
                                   d["rewards"][:, :, player], player, lambda_=1.0, c=1.0, rho=np.inf, eta=ETA)
         vts.append(vt); hps.append(hp); pts.append(pt)

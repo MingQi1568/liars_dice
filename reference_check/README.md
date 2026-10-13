@@ -29,6 +29,10 @@ our training helpers, in float64, and compares value targets, advantages and gra
     ./osenv/bin/python diff_theirs.py diff_batch.npz diff_theirs_out.npz   # reference (JAX)
     python3 diff_compare.py
 
+Add `ft` as a third argument to `diff_ours.py` to check DeepNash's training-time fine-tuning path (v-trace
+evaluates the thresholded + discretized policy, so the importance ratios are not 1); `diff_theirs.py` reads the
+mode from the batch file.
+
 Expected: everything agrees to ~1e-15. (Before the fix, the logit gradient differed because our NeuRD
 centering used the legal-action mean, and the value gradient was half the reference's.) To refresh the
 golden fixture used by `test_rnad.py`, run `python3 make_golden.py` after the three commands above.

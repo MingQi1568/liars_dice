@@ -226,15 +226,11 @@ def test_infoset_loss_weights():
     assert int(cnt.max()) > 1 and cnt.shape[0] < traj.S          # infosets genuinely repeat within a batch
 
 
-def test_matches_reference_losses():
-    """Golden test against DeepMind's reference implementation (open_spiel rnad.py): on a fixed batch from
-    our engine, our v-trace targets, advantages and the gradients of our policy and value losses must equal
-    the reference's outputs (computed by reference_check/, stored in test_data/). Guards against the
-    NeuRD-centering kind of bug coming back."""
+def _check_reference_fixture(name):
     import os
     import numpy as np
-    from rnad import Traj, neurd_loss, vtrace_advantage
-    f = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", "reference_losses_d1.npz"))
+    from rnad import Traj, neurd_loss, penalty_and_ratio, post_process_policy, vtrace_advantage
+    f = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", name))
     old = torch.get_default_dtype()
     torch.set_default_dtype(torch.float64)
     try:
@@ -247,9 +243,12 @@ def test_matches_reference_losses():
         v_on = t["v_online"].clone().requires_grad_(True)
         logp = torch.log_softmax(logits.masked_fill(~mask, float("-inf")), -1)
         pi, logpi = logp.exp().detach(), logp.masked_fill(~mask, 0.0).detach()
-        pen_row = eta * (pi * (logpi - t["logreg"])).sum(-1)
+        merged = post_process_policy(pi, mask, 0.03, 32) if "ft" in f.files and bool(f["ft"]) else None
+        pen_row, ratio = penalty_and_ratio(pi, logpi, t["logreg"], traj.act, t["logmu"], eta, merged)
+        if merged is not None:
+            assert ((ratio - 1).abs() > 1e-6).sum() > 50                # the fixture really exercises ratio != 1
         vh, gm = two_player_vtrace(traj, t["v"], t["logmu"], t["logreg"].gather(1, traj.act[:, None]).squeeze(1),
-                                   eta, None, 1.0, 1.0, pen_row)
+                                   eta, ratio, float("inf"), 1.0, pen_row)
         adv = vtrace_advantage(pi, eta * (logpi - t["logreg"]), traj.act, t["logmu"], gm).clamp(-1e4, 1e4)
         w = 1.0 / torch.bincount(traj.player, minlength=2).double()[traj.player]
         (w * neurd_loss(logits, mask, adv, beta)).sum().backward()
@@ -260,6 +259,35 @@ def test_matches_reference_losses():
         assert (v_on.grad - t["ref_grad_v"]).abs().max() < 1e-12
     finally:
         torch.set_default_dtype(old)
+
+
+def test_matches_reference_losses():
+    """Golden test against DeepMind's reference implementation (open_spiel rnad.py): on a fixed batch from
+    our engine, our v-trace targets, advantages and the gradients of our policy and value losses must equal
+    the reference's outputs (computed by reference_check/, stored in test_data/). Guards against the
+    NeuRD-centering kind of bug coming back."""
+    _check_reference_fixture("reference_losses_d1.npz")
+
+
+def test_matches_reference_losses_with_finetuning():
+    """Same, with DeepNash's training-time fine-tuning on: v-trace evaluates the thresholded + discretized
+    policy, so the importance ratios are not 1 (the off-policy path of the v-trace recursion)."""
+    _check_reference_fixture("reference_losses_d1_ft.npz")
+
+
+def test_post_process_matches_exact_tools():
+    import numpy as np
+    from exact_d1 import discretize_policy, threshold_policy
+    from rnad import post_process_policy
+    g = torch.Generator().manual_seed(0)
+    mask = torch.rand(500, 13, generator=g) < 0.7
+    mask[:, 12] = True
+    logits = 3 * torch.randn(500, 13, generator=g, dtype=torch.float64)
+    p = torch.softmax(logits.masked_fill(~mask, float("-inf")), -1)
+    ours = post_process_policy(p, mask, 0.03, 32).numpy()
+    ref = discretize_policy(threshold_policy(p.numpy()[:, None], mask.numpy(), 0.03)[:, 0], 32)
+    assert np.abs(ours - ref).max() < 1e-12
+    assert np.allclose(ours.sum(-1), 1.0) and np.allclose(ours * 32, np.round(ours * 32))
 
 
 def test_lr_schedule():

@@ -10,7 +10,9 @@ policy is the slow-moving `target` network. Use --resume to continue a run.
 import argparse
 import os
 import random
+import sys
 import time
+from dataclasses import replace
 
 import torch
 
@@ -66,9 +68,12 @@ def main():
     ap.add_argument("--chunk", type=int, default=d.chunk)
     ap.add_argument("--preset", type=str, default="none", choices=["none", "reference"],
                     help="deprecated: the defaults now match the reference, so this does nothing")
-    ap.add_argument("--finetune-thr", type=float, default=0.03,
-                    help="dice 1: also report NashConv after DeepNash's fine-tuning (threshold + discretization)")
-    ap.add_argument("--finetune-disc", type=int, default=32)
+    ap.add_argument("--finetune-thr", type=float, default=d.finetune_thr,
+                    help="DeepNash fine-tuning threshold: used in training after --finetune-from, and dice 1 evals "
+                         "also report NashConv after fine-tuning (threshold + discretization)")
+    ap.add_argument("--finetune-disc", type=int, default=d.finetune_disc)
+    ap.add_argument("--finetune-from", type=int, default=d.finetune_from,
+                    help="learner step after which v-trace evaluates the fine-tuned policy (-1 = never)")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=100)
@@ -100,6 +105,12 @@ def main():
     if args.resume:                    # rebuild exactly the saved run (architecture and options)
         sd = torch.load(args.resume, map_location="cpu")
         cfg = config_from_dict(sd["cfg"])
+        # options that may be changed when resuming (e.g. switch on fine-tuning, or raise beta, mid-run)
+        over = {f: getattr(args, f) for f in ("beta", "finetune_from", "finetune_thr", "finetune_disc", "lr")
+                if f"--{f.replace('_', '-')}" in sys.argv}
+        if over:
+            cfg = replace(cfg, **over)
+            print(f"resume overrides: {over}", flush=True)
         agent = RNaD(cfg)
         agent.load_state_dict(sd)
         print(f"resumed from {args.resume} at step {agent.step_count} (iter {agent.iter})", flush=True)
@@ -110,7 +121,9 @@ def main():
                      value_coef=args.value_coef, adam_eps=args.adam_eps, net=args.net, hidden=args.hidden,
                      score_hidden=args.score_hidden, face_rank=args.face_rank, info_ctx=args.info_ctx,
                      init=args.init, init_reg=args.init_reg, reg_reward=args.reg_reward, loss_norm=args.loss_norm,
-                     adv_mode=args.adv_mode, q_coef=args.q_coef, shaping=args.shaping, chunk=args.chunk)
+                     adv_mode=args.adv_mode, q_coef=args.q_coef, shaping=args.shaping, chunk=args.chunk,
+                     finetune_from=args.finetune_from, finetune_thr=args.finetune_thr,
+                     finetune_disc=args.finetune_disc)
         agent = RNaD(cfg)
     spec = cfg.spec
     if args.init_reg_nfsp and not args.resume:
