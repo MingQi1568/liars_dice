@@ -617,9 +617,12 @@ Seed 1 each. Window means, raw [fine-tuned].
 | equal games (~1.0B) | 0.219 [0.127] | 0.240 [0.132] | 0.368 [0.268] | 0.290 [0.203] |
 | equal games (~1.9B) | 0.213 [0.102] | — | 0.251 [0.164] | 0.241 [0.152] |
 
-- **Batch 16384 gives nothing per step over 4096** (identical within noise at 95-120k), so it is 4x worse
-  per game. The per-iteration gain from 512 -> 4096 has saturated by 4096. (Δm 50k at 16384 only reached
-  its 2nd reset in 12h.)
+- **Batch 16384, Δm 50k: its plateau is still open.** It only finished 2 resets in 12h (the 4 runs competed
+  for memory bandwidth: 0.6 s/step, vs 0.14 s/step alone). At matched resets it is slightly ahead of batch 4096
+  (end of reset 1: 0.407 [0.299] vs 0.419 [0.320]; reset 2: 0.257 [0.170] vs 0.267 [0.187]) and was still falling
+  steeply when it stopped (0.256 -> 0.235 over 102-117k), where the batch-4096 run leveled off only around resets
+  5-6. Per game it costs 4x, but the question is the final plateau, which needs ~300-450k steps (resume from
+  `checkpoints/long12h/b16384_dm50k/rnad_latest.pt`, ~13h alone).
 - **The control continued to 775k steps (15 resets):** raw 0.212 -> 0.206, fine-tuned flat at 0.10-0.11.
   The plateau holds.
 - **Starting at the CFR+ equilibrium does not help:** from NashConv 0.038 (fine-tuned 0.054) it jumps to
