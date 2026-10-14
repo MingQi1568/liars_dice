@@ -631,6 +631,24 @@ Seed 1 each. Window means, raw [fine-tuned].
   wherever they start, not a level they are slowly descending from. Likely drivers (not yet isolated): 1/mu
   importance weights on rarely sampled actions of a sharp policy, and the one-sided beta gate.
 
+### Overnight 2026-10-13 (`sweeps/overnight_dm500k.sh`, plots `checkpoints/long12h/nashconv_batch.png`, `nashconv_late_zoom.png`)
+
+**Batch 16384, Δm 50k continued to 322k steps (6 resets).** End-of-reset windows, raw [fine-tuned]:
+
+| Reset | 3 (150k) | 4 (200k) | 5 (250k) | 6 (300k) |
+|---|---|---|---|---|
+| batch 16384 | 0.226 [0.125] | 0.220 [0.120] | 0.213 [0.116] | **0.208** [0.111] |
+| batch 4096 | 0.228 [0.118] | 0.221 [0.131] | 0.216 [0.116] | 0.214 [0.105] |
+
+Raw pulls ahead with each reset (0.006 at reset 6) and is still falling about 0.005 per reset; at 6 resets it is
+already at the level batch 4096 reached only after ~13-15 resets (0.206). Fine-tuned shows no clear gain yet. Its
+plateau is still not reached.
+
+**Batch 4096 switched to Δm 500k at step 776k, run to 1.42M (one reset, at 1.25M).** Raw 0.203 [0.105] over
+780k-1.0M, 0.202 [0.104] over 1.0-1.25M, 0.202 [0.103] after the reset, vs 0.206 [0.108] in the last 100k at Δm
+50k. A small further gain (~0.004 raw, ~0.005 fine-tuned) over 650k steps; the reset itself changed nothing
+visible. Near the plateau, much longer inner loops help only marginally.
+
 **Settled so far** (1 die): long inner loops (Δm 50k) beat Δm 10k at both batch sizes, and are
 where a bigger batch pays off; batch 4096 + Δm 50k is the best configuration found (0.215 [0.11])
 at ~4x the games; late lr decay gives a stable final checkpoint; eta 0.2 and target EMA 0.001 are

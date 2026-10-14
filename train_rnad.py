@@ -108,6 +108,8 @@ def main():
         # options that may be changed when resuming (e.g. switch on fine-tuning, or raise beta, mid-run)
         over = {f: getattr(args, f) for f in ("beta", "finetune_from", "finetune_thr", "finetune_disc", "lr")
                 if f"--{f.replace('_', '-')}" in sys.argv}
+        if "--sched-sizes" in sys.argv:              # new reference-reset schedule (counted from step 0)
+            over["sched_sizes"], over["sched_repeats"] = sizes, repeats
         if over:
             cfg = replace(cfg, **over)
             print(f"resume overrides: {over}", flush=True)
