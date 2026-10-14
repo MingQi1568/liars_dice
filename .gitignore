@@ -6,4 +6,6 @@ train_nfsp*.log
 train_launch*
 run_training*.ps1
 tournament_*.json
-watch_game_sample.log
+watch_game_*.log
+eval_*.jsonl
+eval_watch.log

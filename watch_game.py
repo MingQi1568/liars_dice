@@ -33,9 +33,10 @@ class ExplainedBot:
     """Acts via the average-policy net (same as NFSPBot), printing the top-K action
     distribution at every decision before sampling from it."""
 
-    def __init__(self, name, net, cfg, top_k=5, sample=True, device="cpu"):
+    def __init__(self, name, net, cfg, top_k=5, sample=True, device="cpu", min_prob=0.0):
         self.name, self.net, self.cfg = name, net, cfg
         self.top_k, self.sample, self.device = top_k, sample, device
+        self.min_prob = min_prob
 
     def act(self, state):
         mask = legal_action_mask(state, self.cfg)
@@ -43,7 +44,15 @@ class ExplainedBot:
         with torch.no_grad():
             logits = forward_states(self.net, [feats], mask.unsqueeze(0), self.device).squeeze(0)
         logits = logits.masked_fill(~mask, float("-inf"))
-        probs = torch.softmax(logits, dim=-1)
+        raw = torch.softmax(logits, dim=-1)
+        probs = raw
+        if self.min_prob > 0:
+            # drop actions below the floor and renormalize; if none clears it, keep the argmax
+            kept = torch.where(raw >= self.min_prob, raw, torch.zeros_like(raw))
+            if kept.sum() <= 0:
+                kept = torch.zeros_like(raw)
+                kept[torch.argmax(raw)] = 1.0
+            probs = kept / kept.sum()
 
         k = min(self.top_k, int(mask.sum()))
         top_p, top_i = torch.topk(probs, k)
@@ -55,7 +64,12 @@ class ExplainedBot:
         print(f"[{self.name}] hand={hand}  current bid: {bid_str}")
         for p, i in zip(top_p.tolist(), top_i.tolist()):
             marker = " *" if i == idx else "  "
-            print(f"  {p * 100:5.1f}%  {action_to_bid(i, self.cfg)}{marker}")
+            if self.min_prob > 0:
+                if p == 0:
+                    break
+                print(f"  {p * 100:5.1f}%  {action_to_bid(i, self.cfg)}{marker} (raw {raw[i].item() * 100:.1f}%)")
+            else:
+                print(f"  {p * 100:5.1f}%  {action_to_bid(i, self.cfg)}{marker}")
         print(f"  -> chooses {chosen}")
         return chosen
 
@@ -68,6 +82,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--greedy", action="store_true", help="argmax instead of sampling")
+    parser.add_argument("--min-prob", type=float, default=0.0,
+                        help="drop actions below this probability and renormalize (e.g. 0.10)")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -79,8 +95,8 @@ def main():
     name_a = f"A({os.path.basename(args.checkpoint_a)})"
     name_b = f"B({os.path.basename(args.checkpoint_b)})"
 
-    bot_a = ExplainedBot(name_a, net_a, cfg_a, top_k=args.top_k, sample=not args.greedy)
-    bot_b = ExplainedBot(name_b, net_b, cfg_b, top_k=args.top_k, sample=not args.greedy)
+    bot_a = ExplainedBot(name_a, net_a, cfg_a, top_k=args.top_k, sample=not args.greedy, min_prob=args.min_prob)
+    bot_b = ExplainedBot(name_b, net_b, cfg_b, top_k=args.top_k, sample=not args.greedy, min_prob=args.min_prob)
     players = [PlayerState(name_a, bot=bot_a), PlayerState(name_b, bot=bot_b)]
 
     print(f"=== {name_a} vs {name_b}, {args.dice} dice each ===\n")
