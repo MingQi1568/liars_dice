@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 checkpoints/
 train_nfsp*.log
+cfr_d1_policy.npy
+reference_check/osenv/
+reference_check/*.npz
+reference_check/*.json
+reference_check/*.log

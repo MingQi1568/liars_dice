@@ -10,12 +10,14 @@ policy is the slow-moving `target` network. Use --resume to continue a run.
 import argparse
 import os
 import random
+import sys
 import time
+from dataclasses import replace
 
 import torch
 
 from game import Game, PlayerState
-from rnad import Config, NFSPReg, RNaD, RNaDBot
+from rnad import Config, NFSPReg, RNaD, RNaDBot, config_from_dict
 
 
 def eval_vs_bot(net, spec, make_opp, n_games, threshold):
@@ -30,26 +32,54 @@ def eval_vs_bot(net, spec, make_opp, n_games, threshold):
 
 
 def main():
+    d = Config()                       # defaults match DeepMind's reference implementation (see rnad.Config)
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dice", type=int, default=5)
+    ap.add_argument("--dice", type=int, default=d.dice)
     ap.add_argument("--total-steps", type=int, default=30000)
-    ap.add_argument("--games-per-step", type=int, default=1024)
-    ap.add_argument("--iter-steps", type=int, default=1000, help="learner steps per R-NaD iteration")
-    ap.add_argument("--eta", type=float, default=0.2)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--gamma", type=float, default=0.01, help="target-network averaging rate")
-    ap.add_argument("--beta", type=float, default=2.0, help="NeuRD logit threshold")
-    ap.add_argument("--shaping", type=float, default=0.0, help="potential-based shaping strength (0 = off)")
-    ap.add_argument("--score-hidden", type=int, default=64, help="hidden width of the per-action scoring MLP")
-    ap.add_argument("--adv-mode", type=str, default="vtrace", choices=["vtrace", "critic"])
-    ap.add_argument("--q-coef", type=float, default=1.0)
-    ap.add_argument("--adv-clip", type=float, default=1e4, help="clip on the importance-weighted advantage")
-    ap.add_argument("--grad-clip", type=float, default=10.0)
-    ap.add_argument("--chunk", type=int, default=8192)
+    ap.add_argument("--games-per-step", type=int, default=d.games_per_step)
+    ap.add_argument("--iter-steps", type=int, default=d.iter_steps, help="learner steps per R-NaD iteration (delta_m)")
+    ap.add_argument("--sched-sizes", type=int, nargs="+", default=None,
+                    help="delta_m schedule (reference EntropySchedule sizes); overrides --iter-steps")
+    ap.add_argument("--sched-repeats", type=int, nargs="+", default=None, help="parallel to --sched-sizes (last must be 1)")
+    ap.add_argument("--eta", type=float, default=d.eta)
+    ap.add_argument("--lr", type=float, default=d.lr)
+    ap.add_argument("--lr-points", type=str, default="",
+                    help="lr schedule 'STEP:LR,STEP:LR', linear from (0, --lr), constant after the last point")
+    ap.add_argument("--gamma", type=float, default=d.gamma, help="target-network averaging rate")
+    ap.add_argument("--beta", type=float, default=d.beta, help="NeuRD logit threshold")
+    ap.add_argument("--adv-clip", type=float, default=d.adv_clip, help="clip on the importance-weighted advantage")
+    ap.add_argument("--grad-clip", type=float, default=d.grad_clip, help="global grad-norm clip before Adam (0 = off)")
+    ap.add_argument("--value-coef", type=float, default=d.value_coef, help="weight of (v - target)^2")
+    ap.add_argument("--adam-eps", type=float, default=d.adam_eps)
+    ap.add_argument("--net", type=str, default=d.net, choices=["infoset", "face"],
+                    help="infoset: MLP on the exact information set (reference); face: face-shared RNaDNet")
+    ap.add_argument("--hidden", type=int, default=d.hidden, help="InfoSetNet torso width")
+    ap.add_argument("--score-hidden", type=int, default=d.score_hidden, help="face net: per-action scoring MLP width")
+    ap.add_argument("--face-rank", action="store_true", help="face net: give the shared face MLP each face's rank")
+    ap.add_argument("--info-ctx", type=int, default=d.info_ctx, help="face net: width of the exact-round context MLP")
+    ap.add_argument("--init", type=str, default=d.init, choices=["haiku", "torch"])
+    ap.add_argument("--init-reg", type=str, default=d.init_reg, choices=["net", "uniform"])
+    ap.add_argument("--reg-reward", type=str, default=d.reg_reward, choices=["expected", "sampled"],
+                    help="regularization penalty in the reward stream: expected KL (reference) or sampled log-ratio")
+    ap.add_argument("--loss-norm", type=str, default=d.loss_norm, choices=["per_player", "global", "infoset"])
+    ap.add_argument("--adv-mode", type=str, default=d.adv_mode, choices=["vtrace", "critic"])
+    ap.add_argument("--q-coef", type=float, default=d.q_coef)
+    ap.add_argument("--shaping", type=float, default=d.shaping, help="potential-based shaping strength (0 = off)")
+    ap.add_argument("--chunk", type=int, default=d.chunk)
+    ap.add_argument("--preset", type=str, default="none", choices=["none", "reference"],
+                    help="deprecated: the defaults now match the reference, so this does nothing")
+    ap.add_argument("--finetune-thr", type=float, default=d.finetune_thr,
+                    help="DeepNash fine-tuning threshold: used in training after --finetune-from, and dice 1 evals "
+                         "also report NashConv after fine-tuning (threshold + discretization)")
+    ap.add_argument("--finetune-disc", type=int, default=d.finetune_disc)
+    ap.add_argument("--finetune-from", type=int, default=d.finetune_from,
+                    help="learner step after which v-trace evaluates the fine-tuned policy (-1 = never)")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="keep a numbered checkpoint every N steps (0 = at every eval); rnad_latest.pt is always updated")
     ap.add_argument("--eval-games", type=int, default=500, help="games per opponent at each eval (dice 5 only)")
     ap.add_argument("--threshold", type=float, default=0.0, help="drop actions below this probability at eval time")
     ap.add_argument("--init-reg-nfsp", type=str, default=None,
@@ -62,6 +92,9 @@ def main():
     ap.add_argument("--checkpoint-dir", type=str, default=None)
     ap.add_argument("--resume", type=str, default=None)
     args = ap.parse_args()
+    sizes = tuple(args.sched_sizes or ())
+    repeats = tuple(args.sched_repeats or ((1,) * len(sizes)))
+    lr_points = tuple((int(p.split(":")[0]), float(p.split(":")[1])) for p in args.lr_points.split(",") if p)
 
     torch.set_num_threads(args.threads)
     random.seed(args.seed)
@@ -69,15 +102,31 @@ def main():
     ckpt_dir = args.checkpoint_dir or os.path.join("checkpoints", f"rnad_d{args.dice}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    cfg = Config(dice=args.dice, score_hidden=args.score_hidden, shaping=args.shaping, games_per_step=args.games_per_step, iter_steps=args.iter_steps, eta=args.eta,
-                 lr=args.lr, gamma=args.gamma, beta=args.beta, adv_clip=args.adv_clip, adv_mode=args.adv_mode, q_coef=args.q_coef,
-                 grad_clip=args.grad_clip, chunk=args.chunk)
-    agent = RNaD(cfg)
-    if args.resume:
+    if args.resume:                    # rebuild exactly the saved run (architecture and options)
         sd = torch.load(args.resume, map_location="cpu")
-        agent.cfg = cfg = Config(**sd["cfg"])
+        cfg = config_from_dict(sd["cfg"])
+        # options that may be changed when resuming (e.g. switch on fine-tuning, or raise beta, mid-run)
+        over = {f: getattr(args, f) for f in ("beta", "finetune_from", "finetune_thr", "finetune_disc", "lr")
+                if f"--{f.replace('_', '-')}" in sys.argv}
+        if "--sched-sizes" in sys.argv:              # new reference-reset schedule (counted from step 0)
+            over["sched_sizes"], over["sched_repeats"] = sizes, repeats
+        if over:
+            cfg = replace(cfg, **over)
+            print(f"resume overrides: {over}", flush=True)
+        agent = RNaD(cfg)
         agent.load_state_dict(sd)
         print(f"resumed from {args.resume} at step {agent.step_count} (iter {agent.iter})", flush=True)
+    else:
+        cfg = Config(dice=args.dice, games_per_step=args.games_per_step, iter_steps=args.iter_steps,
+                     sched_sizes=sizes, sched_repeats=repeats, eta=args.eta, lr=args.lr, lr_points=lr_points,
+                     gamma=args.gamma, beta=args.beta, adv_clip=args.adv_clip, grad_clip=args.grad_clip,
+                     value_coef=args.value_coef, adam_eps=args.adam_eps, net=args.net, hidden=args.hidden,
+                     score_hidden=args.score_hidden, face_rank=args.face_rank, info_ctx=args.info_ctx,
+                     init=args.init, init_reg=args.init_reg, reg_reward=args.reg_reward, loss_norm=args.loss_norm,
+                     adv_mode=args.adv_mode, q_coef=args.q_coef, shaping=args.shaping, chunk=args.chunk,
+                     finetune_from=args.finetune_from, finetune_thr=args.finetune_thr,
+                     finetune_disc=args.finetune_disc)
+        agent = RNaD(cfg)
     spec = cfg.spec
     if args.init_reg_nfsp and not args.resume:
         agent.reg_cur = agent.reg_prev = NFSPReg(args.init_reg_nfsp, spec)
@@ -90,10 +139,23 @@ def main():
         if tag:
             torch.save(sd, os.path.join(ckpt_dir, f"rnad_step{tag}.pt"))
 
+    exact = {}
+
     def evaluate():
-        if spec.dice == 1:
-            from exploit_d1 import exploitability
-            return f"NashConv={exploitability(agent.target, spec, args.threshold):.4f}"
+        if spec.dice == 1:                                     # exact NashConv (exact_d1), raw and fine-tuned
+            from exact_d1 import Tree, discretize_policy, threshold_policy
+            from exploit_d1 import make_state, net_prob_fn
+            if not exact:
+                exact["tree"] = tree = Tree(spec.qmax)
+                exact["states"] = [make_state(h, d) for h in tree.hists for d in range(1, 7)]
+            tree = exact["tree"]
+            pi = net_prob_fn(agent.target, spec, args.threshold)(exact["states"]).reshape(tree.H, 6, tree.A)
+            pi = pi.astype("float64") / pi.sum(-1, keepdims=True)
+            out = f"NashConv={tree.nash_conv(pi)[0]:.4f}"
+            if args.finetune_thr > 0 or args.finetune_disc > 0:
+                ft = discretize_policy(threshold_policy(pi, tree.legal, args.finetune_thr), args.finetune_disc)
+                out += f" NashConv_finetuned={tree.nash_conv(ft)[0]:.4f}"
+            return out
         from bots import SmartBot
         from best_bot import build_best_bot
         ws = eval_vs_bot(agent.target, spec, SmartBot, args.eval_games, args.threshold)
@@ -120,16 +182,17 @@ def main():
             if s % args.log_every == 0 or s == args.total_steps:
                 avg = lambda k: sum(h[k] for h in hist) / len(hist)
                 el = (time.time() - t_start) / 60
-                print(f"[step {s}/{args.total_steps} iter {agent.iter}+{agent.n_in_iter}/{cfg.iter_steps}] "
+                print(f"[step {s}/{args.total_steps} iter {agent.iter}+{agent.n_in_iter}/{agent.schedule.iteration(s)[2]}] "
                       f"len={avg('len'):.1f} kl={avg('kl'):.4f} ent={avg('ent'):.3f} val={avg('val'):.4f} "
-                      f"gn={avg('gn'):.2f} seat0={avg('seat0'):.3f} roll={avg('t_roll'):.2f}s learn={avg('t_learn'):.2f}s "
+                      f"gn={avg('gn'):.2f} lr={hist[-1]['lr']:.2e} seat0={avg('seat0'):.3f} roll={avg('t_roll'):.2f}s learn={avg('t_learn'):.2f}s "
                       f"elapsed={el:.1f}m", flush=True)
                 hist = []
             if s % args.eval_every == 0 or s == args.total_steps:
                 t0 = time.time()
                 res = evaluate()
                 print(f"  >> eval @ step {s} (iter {agent.iter}): {res} [{time.time() - t0:.0f}s]", flush=True)
-                save(s)
+                keep = not args.save_every or s % args.save_every == 0 or s == args.total_steps
+                save(s if keep else None)
             if args.max_hours and (time.time() - t_start) / 3600 > args.max_hours:
                 print(f"max-hours reached at step {s}; saving and stopping", flush=True)
                 save(s)

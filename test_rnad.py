@@ -133,6 +133,192 @@ def test_nfsp_reg_matches_nfsp_policy():
         assert (ref - got[i]).abs().max() < 1e-4
 
 
+def test_entropy_schedule_matches_reference():
+    """Same cases as the reference implementation's tests (open_spiel rnad_test.py / docstring)."""
+    from rnad import EntropySchedule
+    assert EntropySchedule([3, 5, 10], [2, 4, 1]).schedule == [0, 3, 6, 11, 16, 21, 26, 36]
+    expected = [(0, False), (2 / 3, False), (1, True), (0, False), (2 / 3, False), (1, True), (0, False),
+                (0.4, False), (0.8, False), (1, False), (1, True), (0, False), (1 / 3, False), (2 / 3, False),
+                (1, False), (1, False), (1, True), (0, False), (1 / 3, False), (2 / 3, False), (1, False),
+                (1, False), (1, True), (0, False)]
+    sched = EntropySchedule([3, 5, 6], [2, 1, 1])
+    for i, (a, u) in enumerate(expected):
+        got_a, got_u = sched(i)
+        assert abs(got_a - a) < 1e-9 and got_u == u, (i, got_a, got_u, a, u)
+
+
+def test_vtrace_with_expected_penalty_matches_bruteforce():
+    """With an explicit per-row penalty (the reference's expected KL), on-policy v-trace targets still
+    equal the exact return-to-go of the transformed rewards for each player."""
+    torch.manual_seed(3)
+    spec = Spec(dice=2)
+    traj = collect(VecEnv(spec, 48), RNaDNet(spec).eval(), shaping=0.1)
+    v = torch.randn(traj.S)
+    pen = 0.2 * torch.rand(traj.S)
+    vh, gm = two_player_vtrace(traj, v, traj.logmu, traj.logmu, 0.2, pen=pen)
+    r_env = traj.shape.clone()
+    fin = traj.final
+    r_env[fin] += torch.where(traj.winner[traj.env[fin]] == traj.player[fin], 1.0, -1.0)
+    order = torch.argsort(traj.env, stable=True)
+    for e in range(traj.n_envs):
+        rows = order[traj.env[order] == e]
+        for i in (0, 1):
+            r_i = torch.stack([(r_env[r] - pen[r]) if traj.player[r] == i else (-r_env[r] + pen[r]) for r in rows])
+            future = torch.flip(torch.cumsum(torch.flip(r_i, [0]), 0), [0])
+            after = torch.cat([future[1:], torch.zeros(1)])
+            for k, r in enumerate(rows):
+                if traj.player[r] == i:
+                    assert abs(float(vh[r]) - float(future[k])) < 1e-4
+                    assert abs(float(gm[r] + v[r]) - float(r_env[r] + after[k])) < 1e-4
+
+
+def test_reference_options_learn_and_round_trip():
+    """Reference-mode training (infoset MLP, expected-KL reward, per-player loss, no grad clip, a
+    multi-size schedule) runs, moves the regularization policy at the scheduled steps, and checkpoints."""
+    from rnad import load_policy_net
+    torch.manual_seed(5)
+    cfg = Config(dice=1, games_per_step=256, chunk=512, net="infoset", hidden=32, reg_reward="expected",
+                 loss_norm="per_player", grad_clip=0.0, sched_sizes=(3, 5), sched_repeats=(1, 1))
+    agent = RNaD(cfg)
+    iters = []
+    for _ in range(13):
+        m = agent.learn_step()
+        assert all(torch.isfinite(torch.tensor(float(m[k]))) for k in ("kl", "ent", "val", "pol", "gn"))
+        iters.append(agent.iter)
+    assert iters[2] == 1 and iters[7] == 2 and iters[12] == 3 and iters[1] == 0 and iters[6] == 1, iters
+    import os, tempfile
+    path = os.path.join(tempfile.mkdtemp(), "ck.pt")
+    torch.save(agent.state_dict(), path)
+    net, cfg2 = load_policy_net(path)
+    static, win, wmask, mask = py_features(_dummy_state(), cfg.spec)
+    a = policy_probs(agent.target, static[None], win[None], wmask[None], mask[None])
+    b = policy_probs(net, static[None], win[None], wmask[None], mask[None])
+    assert cfg2.net == "infoset" and torch.allclose(a, b)
+
+
+def test_exact_tools_match_reference_solver():
+    """The vectorized exact solver (exact_d1) agrees with the slow recursive one (exploit_d1.Game1)."""
+    import numpy as np
+    from exact_d1 import Tree, discretize_policy
+    from exploit_d1 import Game1
+    spec = Spec(dice=1)
+    tree = Tree(spec.qmax)
+    pi = tree.softmax(np.random.default_rng(1).normal(size=(tree.H, 6, tree.A)))
+    g = Game1(lambda states: np.zeros((len(states), tree.A)), spec)
+    g.probs = pi
+    assert abs(tree.nash_conv(pi)[0] - g.nash_conv()[0]) < 1e-9
+    assert abs(tree.seat0_value(pi) - g.seat0_value()) < 1e-9
+    d = discretize_policy(pi, 32)
+    assert np.allclose(d.sum(-1), 1) and np.allclose(d * 32, np.round(d * 32))
+
+
+def test_infoset_loss_weights():
+    """loss_norm='infoset': within each player, every distinct information set in the batch gets total
+    policy-loss weight 1/(number of distinct infosets of that player)."""
+    torch.manual_seed(6)
+    agent = RNaD(Config(dice=1, games_per_step=300, chunk=512, net="infoset", hidden=16, loss_norm="infoset"))
+    m = agent.learn_step()
+    assert all(torch.isfinite(torch.tensor(float(m[k]))) for k in ("kl", "ent", "val", "pol", "gn"))
+    from vec_env import STATIC_DIM
+    traj = collect(VecEnv(Spec(dice=1), 300), agent.net)
+    key = torch.cat([traj.player[:, None].float(), traj.static[:, STATIC_DIM:]], 1)
+    _, inv, cnt = torch.unique(key, dim=0, return_inverse=True, return_counts=True)
+    assert int(cnt.max()) > 1 and cnt.shape[0] < traj.S          # infosets genuinely repeat within a batch
+
+
+def _check_reference_fixture(name):
+    import os
+    import numpy as np
+    from rnad import Traj, neurd_loss, penalty_and_ratio, post_process_policy, vtrace_advantage
+    f = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", name))
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        t = {k: torch.tensor(f[k]) for k in f.files}
+        cols = {k: t[k] for k in ("env", "player", "act", "logmu", "final", "shape")}
+        traj = Traj(cols, [int(x) for x in f["offsets"]], t["winner"], int(t["winner"].shape[0]))
+        mask = t["mask"].bool()
+        eta, beta = 0.2, 2.0
+        logits = t["logits"].clone().requires_grad_(True)
+        v_on = t["v_online"].clone().requires_grad_(True)
+        logp = torch.log_softmax(logits.masked_fill(~mask, float("-inf")), -1)
+        pi, logpi = logp.exp().detach(), logp.masked_fill(~mask, 0.0).detach()
+        merged = post_process_policy(pi, mask, 0.03, 32) if "ft" in f.files and bool(f["ft"]) else None
+        pen_row, ratio = penalty_and_ratio(pi, logpi, t["logreg"], traj.act, t["logmu"], eta, merged)
+        if merged is not None:
+            assert ((ratio - 1).abs() > 1e-6).sum() > 50                # the fixture really exercises ratio != 1
+        vh, gm = two_player_vtrace(traj, t["v"], t["logmu"], t["logreg"].gather(1, traj.act[:, None]).squeeze(1),
+                                   eta, ratio, float("inf"), 1.0, pen_row)
+        adv = vtrace_advantage(pi, eta * (logpi - t["logreg"]), traj.act, t["logmu"], gm).clamp(-1e4, 1e4)
+        w = 1.0 / torch.bincount(traj.player, minlength=2).double()[traj.player]
+        (w * neurd_loss(logits, mask, adv, beta)).sum().backward()
+        (w * (v_on - vh) ** 2).sum().backward()
+        assert (vh - t["ref_vh"]).abs().max() < 1e-10
+        assert ((adv - t["ref_adv"]).abs() * mask).max() < 1e-9
+        assert (logits.grad - t["ref_grad_logit"]).abs().max() < 1e-12
+        assert (v_on.grad - t["ref_grad_v"]).abs().max() < 1e-12
+    finally:
+        torch.set_default_dtype(old)
+
+
+def test_matches_reference_losses():
+    """Golden test against DeepMind's reference implementation (open_spiel rnad.py): on a fixed batch from
+    our engine, our v-trace targets, advantages and the gradients of our policy and value losses must equal
+    the reference's outputs (computed by reference_check/, stored in test_data/). Guards against the
+    NeuRD-centering kind of bug coming back."""
+    _check_reference_fixture("reference_losses_d1.npz")
+
+
+def test_matches_reference_losses_with_finetuning():
+    """Same, with DeepNash's training-time fine-tuning on: v-trace evaluates the thresholded + discretized
+    policy, so the importance ratios are not 1 (the off-policy path of the v-trace recursion)."""
+    _check_reference_fixture("reference_losses_d1_ft.npz")
+
+
+def test_post_process_matches_exact_tools():
+    import numpy as np
+    from exact_d1 import discretize_policy, threshold_policy
+    from rnad import post_process_policy
+    g = torch.Generator().manual_seed(0)
+    mask = torch.rand(500, 13, generator=g) < 0.7
+    mask[:, 12] = True
+    logits = 3 * torch.randn(500, 13, generator=g, dtype=torch.float64)
+    p = torch.softmax(logits.masked_fill(~mask, float("-inf")), -1)
+    ours = post_process_policy(p, mask, 0.03, 32).numpy()
+    ref = discretize_policy(threshold_policy(p.numpy()[:, None], mask.numpy(), 0.03)[:, 0], 32)
+    assert np.abs(ours - ref).max() < 1e-12
+    assert np.allclose(ours.sum(-1), 1.0) and np.allclose(ours * 32, np.round(ours * 32))
+
+
+def test_lr_schedule():
+    from rnad import lr_at
+    cfg = Config(lr=5e-5, lr_points=((100, 5e-5), (200, 5e-6)))
+    assert lr_at(cfg, 0) == 5e-5 and lr_at(cfg, 99) == 5e-5
+    assert abs(lr_at(cfg, 150) - 2.75e-5) < 1e-12 and lr_at(cfg, 200) == 5e-6 and lr_at(cfg, 10 ** 6) == 5e-6
+    assert lr_at(Config(lr=3e-4), 12345) == 3e-4
+
+
+def test_old_checkpoint_configs_load():
+    """Checkpoints from before the centering fix carry a removed `center` option, and the oldest ones
+    predate the `net` option (they used the face net); both must still load."""
+    from rnad import config_from_dict
+    from dataclasses import asdict
+    d = asdict(Config(dice=1))
+    d.pop("net")
+    d["center"] = "legal"
+    cfg = config_from_dict(d)
+    assert cfg.net == "face" and not hasattr(cfg, "center")
+
+
+def test_face_rank_starts_face_invariant():
+    """With face-rank inputs, the face net must start exactly face-invariant under both inits (Haiku-style
+    init used to overwrite the zeroed rank weights)."""
+    for init in ("torch", "haiku"):
+        agent = RNaD(Config(dice=2, net="face", face_rank=True, info_ctx=16, init=init, games_per_step=8))
+        w = agent.net.shared_face_mlp[0].weight
+        assert (w[:, 10:] == 0).all(), init
+
+
 def _dummy_state():
     from game import Bid, GameState
     return GameState([3], 0, 2, [1, 1], 2, Bid(1, 4), [(1, Bid(1, 4))], 1)
